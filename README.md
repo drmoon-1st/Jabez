@@ -3,18 +3,8 @@
 파일 구조 일부 수정
 golfDataset\스포츠 사람 동작 영상(골프)\Training\Public\male 아래에 각 스윙별 폴더가 아닌,
 tf폴더 아래
-├─balanced_true  
-│  └─skel_csv  
-├─false  
-│  ├─cropped  
-│  ├─jpg  
-│  ├─json  
-│  └─skel_csv  
-└─true  
-    ├─cropped  
-    ├─jpg  
-    ├─json  
-    └─skel_csv
+
+<pre lang="markdown"> ``` ├─balanced_true │ └─skel_csv ├─false │ ├─cropped │ ├─jpg │ ├─json │ └─skel_csv └─true ├─cropped ├─jpg ├─json └─skel_csv ``` </pre>
 
 해당 구조로 작성함
 
