@@ -1,0 +1,11 @@
+torch==2.2.1+cu121
+torchvision==0.17.1+cu121
+torchaudio==2.2.1+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+pandas>=1.5.0
+opencv-python
+Pillow
+numpy=1.26
+tqdm
+scikit-learn
