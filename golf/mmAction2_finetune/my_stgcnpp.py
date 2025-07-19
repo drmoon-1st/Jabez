@@ -1,4 +1,4 @@
-ann_file = 'D:\\golfDataset\\dataset\\test\\crop_pkl\\skeleton_dataset_90_10.pkl'
+ann_file = 'D:\\golfDataset\\dataset\\train\\crop_pkl\\skeleton_dataset_90_10.pkl'
 auto_scale_lr = dict(base_batch_size=128, enable=False)
 custom_hooks = [
     dict(
@@ -57,8 +57,7 @@ test_cfg = dict(type='TestLoop')
 test_dataloader = dict(
     batch_size=1,
     dataset=dict(
-        ann_file=
-        'D:\\golfDataset\\dataset\\test\\crop_pkl\\skeleton_dataset_90_10.pkl',
+        ann_file= ann_file,
         pipeline=[
             dict(type='PreNormalize2D'),
             dict(dataset='coco', feats=[
@@ -101,8 +100,7 @@ train_dataloader = dict(
     batch_size=16,
     dataset=dict(
         dataset=dict(
-            ann_file=
-            'D:\\golfDataset\\dataset\\test\\crop_pkl\\skeleton_dataset_90_10.pkl',
+            ann_file= ann_file,
             pipeline=[
                 dict(type='PreNormalize2D'),
                 dict(dataset='coco', feats=[
@@ -134,8 +132,7 @@ val_cfg = dict(type='ValLoop')
 val_dataloader = dict(
     batch_size=16,
     dataset=dict(
-        ann_file=
-        'D:\\golfDataset\\dataset\\test\\crop_pkl\\skeleton_dataset_90_10.pkl',
+        ann_file= ann_file,
         pipeline=[
             dict(type='PreNormalize2D'),
             dict(dataset='coco', feats=[
