@@ -3,3 +3,9 @@ golf/CNN/cnn_gru_model.pth
 golf/Timesformer_finetune/timesformer_finetuned.pth
 
 golf/Timesformer_finetune/checkpoint.pth
+
+golf/fusion/embedding_data/stgcnpp/*
+!golf/fusion/embedding_data/stgcnpp/
+
+golf/fusion/embedding_data/timesformer/*
+!golf/fusion/embedding_data/timesformer/
