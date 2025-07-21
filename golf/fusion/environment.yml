@@ -1,0 +1,12 @@
+name: fusion
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10          # 3.10 계열이면 대부분 호환
+  - numpy                # 행렬·벡터 계산
+  - pandas               # CSV 로드 & PKL 작성
+  - tqdm                 # (선택) 진행률 표시, parent 스크립트에 사용하려면 추가
+  - scikit-learn         # 분류기·스케일러 등 ML 툴킷
+  - pytorch
+  - torchvision       # (GPU 환경이라면 cudatoolkit도 자동 따라옵니다)

@@ -82,7 +82,7 @@ def extract(pkl_path: Path, split_tag: str, cfg_file: str, ckpt: str, device: st
             labels.append(label)
 
     em_arr = np.stack(embs, 0)
-    lbl_arr = np.array(labels, dtype=np.int64)
+    lbl_arr = np.array(labels, dtype=np.int64).reshape(-1, 1)   # (N, 1)
     split_dir = out_dir / split_tag
     split_dir.mkdir(parents=True, exist_ok=True)
     np.save(split_dir / 'embeddings.npy', em_arr)

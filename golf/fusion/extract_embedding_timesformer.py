@@ -75,7 +75,9 @@ def load_clip(path: Path):
 class SwingDataset(Dataset):
     def __init__(self, root: Path, id_list):
         mapping = {"balanced_true": 1, "false": 0}
-        self.samples = []
+
+        # (1) id  ➜ (path, label) 딕셔너리를 먼저 만든다
+        id2item = {}
         for sub, label in mapping.items():
             video_dir = root / sub / "crop_video"
             if not video_dir.exists():
@@ -83,8 +85,14 @@ class SwingDataset(Dataset):
             for p in video_dir.glob("*.mp4"):
                 stem = p.stem
                 vid_id = stem[:-5] if stem.endswith("_crop") else stem
-                if vid_id in id_list:
-                    self.samples.append((p, label))
+                id2item[vid_id] = (p, label)
+
+        # (2) id_list 순서대로 self.samples 완성
+        self.samples = [id2item[i] for i in id_list if i in id2item]
+        missing = set(id_list) - id2item.keys()
+        if missing:
+            print(f"⚠️ {len(missing)} ids not found: {list(missing)[:5]} ...")
+
         print(f"✅ {len(self.samples)} samples loaded from {root}")
 
     def __len__(self):
