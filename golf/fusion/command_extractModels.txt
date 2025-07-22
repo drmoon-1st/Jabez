@@ -11,11 +11,11 @@ python -u D:\Jabez\golf\fusion\extract_embedding_stgcn.py ^
   --num-workers 0
 
 ##### timesformer
-python -u extract_embedding_timesformer.py `
-  --root D:\golfDataset\dataset\train `
-  --train-list D:\Jabez\golf\fusion\train_ids.txt `
-  --valid-list D:\Jabez\golf\fusion\valid_ids.txt `
-  --num-frames 32 --clips-per-vid 5 --img-size 224 `
-  --batch-size 1 --num-workers 0 `
-  --pretrained D:\TimeSformer\pretrained\TimeSformer_divST_96x4_224_K600.pyth `
+python -u extract_embedding_timesformer.py ^
+  --root D:\golfDataset\dataset\train ^
+  --train-list D:\Jabez\golf\fusion\ids_txt\train_ids.txt ^
+  --valid-list D:\Jabez\golf\fusion\ids_txt\valid_ids.txt ^
+  --num-frames 32 --clips-per-vid 5 --img-size 224 ^
+  --batch-size 1 --num-workers 0 ^
+  --pretrained D:\TimeSformer\pretrained\TimeSformer_divST_96x4_224_K600.pyth ^
   --output-dir D:\Jabez\golf\embbeding_data\timesformer

@@ -17,28 +17,63 @@ from timesformer.models.vit import TimeSformer
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="TimeSformer embedding extraction with fixed train/valid split"
+        description="TimeSformer embedding extraction with fixed train/valid/test split"
     )
     parser.add_argument('--root',        type=Path, required=True,
                         help='Dataset root (e.g. D:\\golfDataset\\dataset\\train)')
-    parser.add_argument('--train-list',  type=Path, required=True,
+    parser.add_argument('--train-list',  type=Path,
                         help='newline-separated train video IDs')
-    parser.add_argument('--valid-list',  type=Path, required=True,
+    parser.add_argument('--valid-list',  type=Path,
                         help='newline-separated valid video IDs')
-    parser.add_argument('--num-frames',  type=int, default=32)
+    parser.add_argument('--test-list',   type=Path,
+                        help='newline-separated test video IDs (optional)')
+    parser.add_argument('--num-frames',   type=int, default=32)
     parser.add_argument('--clips-per-vid', type=int, default=5)
-    parser.add_argument('--img-size',    type=int, default=224)
-    parser.add_argument('--batch-size',  type=int, default=1)
-    parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--pretrained',  type=Path, required=True,
+    parser.add_argument('--img-size',     type=int, default=224)
+    parser.add_argument('--batch-size',   type=int, default=1)
+    parser.add_argument('--num-workers',  type=int, default=0)
+    parser.add_argument('--pretrained',   type=Path, required=True,
                         help='사전학습 모델 경로 (.pyth)')
-    parser.add_argument('--output-dir',  type=Path, required=True,
+    parser.add_argument('--output-dir',   type=Path, required=True,
                         help='임베딩 저장 디렉토리')
     return parser.parse_args()
 
 args = parse_args()
 
-# reproducibility
+# ---------------------------------------------------
+# 인수로 받은 경로 검증
+# ---------------------------------------------------
+# root 디렉토리 확인
+if not args.root.is_dir():
+    sys.exit(f"[ERROR] --root 경로가 존재하지 않거나 디렉토리가 아닙니다: {args.root}")
+
+# train/valid/test 리스트 파일 확인
+if args.test_list:
+    if not args.test_list.is_file():
+        sys.exit(f"[ERROR] --test-list 파일이 존재하지 않습니다: {args.test_list}")
+else:
+    if args.train_list is None or not args.train_list.is_file():
+        sys.exit(f"[ERROR] --train-list 파일을 지정하고, 경로가 유효한지 확인하세요: {args.train_list}")
+    if args.valid_list is None or not args.valid_list.is_file():
+        sys.exit(f"[ERROR] --valid-list 파일을 지정하고, 경로가 유효한지 확인하세요: {args.valid_list}")
+
+# pretrained 모델 파일 확인
+if not args.pretrained.is_file():
+    sys.exit(f"[ERROR] --pretrained 모델 파일이 존재하지 않습니다: {args.pretrained}")
+
+# output-dir 위치 생성 가능 여부 확인
+try:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    test_file = args.output_dir / ".write_test"
+    with open(test_file, "w") as f:
+        f.write("test")
+    test_file.unlink()
+except Exception as e:
+    sys.exit(f"[ERROR] --output-dir 경로에 쓸 수 없습니다 ({args.output_dir}): {e}")
+
+# ---------------------------------------------------
+# reproducibility 설정
+# ---------------------------------------------------
 SEED = 42
 torch.manual_seed(SEED)
 random.seed(SEED)
@@ -75,8 +110,6 @@ def load_clip(path: Path):
 class SwingDataset(Dataset):
     def __init__(self, root: Path, id_list):
         mapping = {"balanced_true": 1, "false": 0}
-
-        # (1) id  ➜ (path, label) 딕셔너리를 먼저 만든다
         id2item = {}
         for sub, label in mapping.items():
             video_dir = root / sub / "crop_video"
@@ -86,13 +119,10 @@ class SwingDataset(Dataset):
                 stem = p.stem
                 vid_id = stem[:-5] if stem.endswith("_crop") else stem
                 id2item[vid_id] = (p, label)
-
-        # (2) id_list 순서대로 self.samples 완성
         self.samples = [id2item[i] for i in id_list if i in id2item]
         missing = set(id_list) - id2item.keys()
         if missing:
             print(f"⚠️ {len(missing)} ids not found: {list(missing)[:5]} ...")
-
         print(f"✅ {len(self.samples)} samples loaded from {root}")
 
     def __len__(self):
@@ -104,17 +134,21 @@ class SwingDataset(Dataset):
         clips = torch.stack(clips, dim=0)       # (CLIPS_PER_VID,3,T,H,W)
         return clips, label
 
-# load ID lists
-train_ids = args.train_list.read_text().splitlines()
-valid_ids = args.valid_list.read_text().splitlines()
-
-# datasets & loaders
-train_ds = SwingDataset(args.root, train_ids)
-valid_ds = SwingDataset(args.root, valid_ids)
-train_ld = DataLoader(train_ds, batch_size=1, shuffle=False,
-                      num_workers=args.num_workers, pin_memory=True)
-valid_ld = DataLoader(valid_ds, batch_size=1, shuffle=False,
-                      num_workers=args.num_workers, pin_memory=True)
+# load ID lists and create loaders
+if args.test_list:
+    test_ids = args.test_list.read_text().splitlines()
+    test_ds  = SwingDataset(args.root, test_ids)
+    test_ld  = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                          num_workers=args.num_workers, pin_memory=True)
+else:
+    train_ids = args.train_list.read_text().splitlines()
+    valid_ids = args.valid_list.read_text().splitlines()
+    train_ds  = SwingDataset(args.root, train_ids)
+    valid_ds  = SwingDataset(args.root, valid_ids)
+    train_ld  = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False,
+                           num_workers=args.num_workers, pin_memory=True)
+    valid_ld  = DataLoader(valid_ds, batch_size=args.batch_size, shuffle=False,
+                           num_workers=args.num_workers, pin_memory=True)
 
 # model load & strip heads
 model = TimeSformer(
@@ -128,32 +162,32 @@ model.model.head = nn.Identity()
 if hasattr(model.model, 'cls_head'): model.model.cls_head = nn.Identity()
 model.eval()
 
-# extraction
+# extraction function
 def extract(loader, split_name):
     embs, labels = [], []
     for clips, label in tqdm(loader, desc=f"{split_name} Embeddings", ncols=80):
-        clips = clips.squeeze(0)  # (CLIPS_PER_VID,3,T,H,W)
+        clips = clips.squeeze(0)
         clip_embs = []
         for clip in clips:
-            c = clip.unsqueeze(0).to(device)  # (1,3,T,H,W)
+            c = clip.unsqueeze(0).to(device)
             with torch.no_grad():
                 feats = model.model.forward_features(c)
-            if feats.ndim == 3:
-                cls = feats[:,0,:]  # (1,D)
-            else:
-                cls = feats        # (1,D)
+            cls = feats[:,0,:] if feats.ndim == 3 else feats
             clip_embs.append(cls.squeeze(0).cpu().numpy())
             del c, feats, cls
             torch.cuda.empty_cache()
-        emb = np.stack(clip_embs,0).mean(0)  # (D,)
+        emb = np.stack(clip_embs,0).mean(0)
         embs.append(emb)
         labels.append(label)
-    out_dir = args.output_dir/split_name
+    out_dir = args.output_dir / split_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir/'embeddings.npy', np.stack(embs))
-    np.save(out_dir/'labels.npy',    np.array(labels))
+    np.save(out_dir / 'embeddings.npy', np.stack(embs))
+    np.save(out_dir / 'labels.npy',    np.array(labels))
     print(f"✅ {split_name} saved to {out_dir}")
 
-# run
-extract(train_ld, 'train')
-extract(valid_ld, 'valid')
+# run extraction
+if args.test_list:
+    extract(test_ld, 'test')
+else:
+    extract(train_ld, 'train')
+    extract(valid_ld, 'valid')
