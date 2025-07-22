@@ -12,4 +12,4 @@ golf/fusion/embedding_data/timesformer/*
 
 golf/fusion/work_dirs/my_stgcnpp
 
-golf\fusion\fusion_ckpt\fusion_mlp_best.pth
+golf/fusion/fusion_ckpt/fusion_mlp_best.pth
