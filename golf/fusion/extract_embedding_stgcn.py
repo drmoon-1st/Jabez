@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os, sys
 # (필요시) 중복 OpenMP 런타임 허용
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
@@ -9,8 +8,8 @@ sys.path.insert(0, BASE_DIR)
 
 import argparse
 from pathlib import Path
-import pickle
 import numpy as np
+import pickle
 import torch
 import torch.nn as nn
 from mmengine.config import Config
@@ -58,28 +57,45 @@ def extract(pkl_path: Path, split_tag: str, cfg_file: str, ckpt: str, device: st
         raise RuntimeError("cls_head 내부에 nn.Linear 레이어가 없습니다.")
 
     embs, labels = [], []
+    feat_dim = last_lin.in_features        # 256 (ST-GCN++) 특징 차원
     with torch.no_grad():
         for batch in runner.test_dataloader:
             data_samples = batch['data_samples']
             label = int(data_samples[0].gt_label)
 
             clip_embs = []
-            # hook으로 입력 특징 저장
-            handle = last_lin.register_forward_hook(lambda m, inp, out: clip_embs.append(inp[0].cpu().squeeze(0)))
+            handle = last_lin.register_forward_hook(
+                lambda m, inp, out: clip_embs.append(inp[0].cpu().squeeze(0))
+            )
 
+            # ---------- forward ----------
             inputs = batch['inputs']
             if isinstance(inputs, list):
                 for clip in inputs:
-                    runner.model.forward(clip.unsqueeze(0).to(device), data_samples, mode='predict')
+                    runner.model.forward(clip.unsqueeze(0).to(device),
+                                         data_samples, mode='predict')
             else:
-                inp = inputs.unsqueeze(0).to(device) if torch.is_tensor(inputs) else {k: v.unsqueeze(0).to(device) for k, v in inputs.items()}
+                inp = (inputs.unsqueeze(0).to(device)
+                       if torch.is_tensor(inputs)
+                       else {k: v.unsqueeze(0).to(device) for k, v in inputs.items()})
                 runner.model.forward(inp, data_samples, mode='predict')
-
             handle.remove()
-            # 클립별 임베딩 평균
+
+            # ---------- (1) 빈 리스트 방지 ----------
+            if len(clip_embs) == 0:                      # hook이 한 번도 안 불렸을 때
+                clip_embs.append(torch.zeros(feat_dim))  # 0-벡터 패딩
+
+            # 클립 평균 → video embedding
             video_emb = torch.stack(clip_embs, 0).mean(0).cpu().numpy()
+
+            # ---------- (2) NaN / Inf 치환 ----------
+            if np.isnan(video_emb).any() or np.isinf(video_emb).any():
+                video_emb = np.nan_to_num(video_emb, nan=0.0,
+                                          posinf=0.0, neginf=0.0)
+
             embs.append(video_emb)
             labels.append(label)
+
 
     em_arr = np.stack(embs, 0)
     lbl_arr = np.array(labels, dtype=np.int64).reshape(-1, 1)   # (N, 1)
