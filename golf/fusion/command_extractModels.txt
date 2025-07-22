@@ -1,0 +1,21 @@
+cd Jabez\golf\fusion
+
+##### stgcn
+python -u D:\Jabez\golf\fusion\extract_embedding_stgcn.py ^
+  --cfg "D:\mmaction2\configs\skeleton\stgcnpp\my_stgcnpp.py" ^
+  --ckpt "D:\mmaction2\checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth" ^
+  --device "cuda:0" ^
+  --out-dir "D:\Jabez\golf\fusion\embbeding_data\stgcnpp" ^
+  --train-pkl "D:\golfDataset\dataset\train\crop_pkl\skeleton_dataset_train.pkl" ^
+  --valid-pkl "D:\golfDataset\dataset\train\crop_pkl\skeleton_dataset_valid.pkl" ^
+  --num-workers 0
+
+##### timesformer
+python -u extract_embedding_timesformer.py `
+  --root D:\golfDataset\dataset\train `
+  --train-list D:\Jabez\golf\fusion\train_ids.txt `
+  --valid-list D:\Jabez\golf\fusion\valid_ids.txt `
+  --num-frames 32 --clips-per-vid 5 --img-size 224 `
+  --batch-size 1 --num-workers 0 `
+  --pretrained D:\TimeSformer\pretrained\TimeSformer_divST_96x4_224_K600.pyth `
+  --output-dir D:\Jabez\golf\embbeding_data\timesformer
