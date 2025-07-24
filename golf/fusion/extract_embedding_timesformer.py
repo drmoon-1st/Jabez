@@ -117,7 +117,8 @@ class SwingDataset(Dataset):
                 continue
             for p in video_dir.glob("*.mp4"):
                 stem = p.stem
-                vid_id = stem[:-5] if stem.endswith("_crop") else stem
+                vid_id = stem   # video ID는 파일 이름, ids_***.txt와 비교해서 찾음 
+                # ids와 파일 이름 모두 _crop이 붙어 있기 때문에 그냥 stem을 받는다
                 id2item[vid_id] = (p, label)
         self.samples = [id2item[i] for i in id_list if i in id2item]
         missing = set(id_list) - id2item.keys()
