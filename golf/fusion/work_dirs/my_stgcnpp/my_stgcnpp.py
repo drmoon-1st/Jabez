@@ -58,7 +58,7 @@ test_dataloader = dict(
     batch_size=1,
     dataset=dict(
         ann_file=
-        'D:\\golfDataset\\dataset\\train\\crop_pkl\\skeleton_dataset_valid.pkl',
+        'D:\\golfDataset\\dataset\\test\\crop_pkl\\skeleton_dataset_test.pkl',
         pipeline=[
             dict(type='PreNormalize2D'),
             dict(dataset='coco', feats=[
