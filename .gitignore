@@ -14,7 +14,5 @@ golf/fusion/work_dirs/my_stgcnpp
 
 golf/fusion/fusion_ckpt/fusion_mlp_best.pth
 
-golf/preprocessing/video_processing/embedding_data
-
 golf/fusion/embedding_data/timesformer/*
 !golf/fusion/embedding_data/timesformer/
