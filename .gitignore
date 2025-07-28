@@ -16,3 +16,6 @@ golf/fusion/fusion_ckpt/fusion_mlp_best.pth
 
 golf/fusion/embedding_data/timesformer/*
 !golf/fusion/embedding_data/timesformer/
+
+golf/fusion/embbeding_data/timesformer/*
+!golf/fusion/embbeding_data/timesformer/
