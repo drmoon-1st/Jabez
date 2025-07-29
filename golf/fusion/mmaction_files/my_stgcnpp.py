@@ -24,7 +24,7 @@ env_cfg = dict(
     mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
 fp16 = dict(loss_scale='dynamic', type='Fp16OptimizerHook')
 launcher = 'none'
-load_from = 'checkpoints\\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth'
+load_from = 'checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth'
 log_level = 'INFO'
 log_processor = dict(by_epoch=True, type='LogProcessor', window_size=20)
 model = dict(
@@ -57,8 +57,7 @@ test_cfg = dict(type='TestLoop')
 test_dataloader = dict(
     batch_size=1,
     dataset=dict(
-        ann_file=
-        'D:\\golfDataset\\dataset\\crop_pkl\\skeleton_dataset_valid.pkl',
+        ann_file= ann_file,
         pipeline=[
             dict(type='PreNormalize2D'),
             dict(dataset='coco', feats=[
@@ -76,8 +75,8 @@ test_dataloader = dict(
         split='xsub_val',
         test_mode=True,
         type='PoseDataset'),
-    num_workers=0,
-    persistent_workers=False,
+    num_workers=2,
+    persistent_workers=True,
     sampler=dict(shuffle=False, type='DefaultSampler'))
 test_evaluator = [
     dict(type='AccMetric'),
@@ -94,7 +93,8 @@ test_pipeline = [
     dict(type='PoseDecode'),
     dict(num_person=2, type='FormatGCNInput'),
     dict(type='PackActionInputs'),
-    dict(type='AddFrameDirToMeta'),
+    dict(type='AddFrameDirToMeta')
+
 ]
 train_cfg = dict(
     max_epochs=8, type='EpochBasedTrainLoop', val_begin=1, val_interval=1)
@@ -102,8 +102,7 @@ train_dataloader = dict(
     batch_size=16,
     dataset=dict(
         dataset=dict(
-            ann_file=
-            'D:\\golfDataset\\dataset\\train\\crop_pkl\\skeleton_dataset_90_10.pkl',
+            ann_file= ann_file,
             pipeline=[
                 dict(type='PreNormalize2D'),
                 dict(dataset='coco', feats=[
@@ -130,14 +129,13 @@ train_pipeline = [
     dict(type='PoseDecode'),
     dict(num_person=2, type='FormatGCNInput'),
     dict(type='PackActionInputs'),
-    dict(type='AddFrameDirToMeta'),
+    dict(type='AddFrameDirToMeta')
 ]
 val_cfg = dict(type='ValLoop')
 val_dataloader = dict(
     batch_size=16,
     dataset=dict(
-        ann_file=
-        'D:\\golfDataset\\dataset\\train\\crop_pkl\\skeleton_dataset_90_10.pkl',
+        ann_file= ann_file,
         pipeline=[
             dict(type='PreNormalize2D'),
             dict(dataset='coco', feats=[
@@ -171,7 +169,7 @@ val_pipeline = [
     dict(type='PoseDecode'),
     dict(num_person=2, type='FormatGCNInput'),
     dict(type='PackActionInputs'),
-    dict(type='AddFrameDirToMeta'),
+    dict(type='AddFrameDirToMeta')
 ]
 vis_backends = [
     dict(type='LocalVisBackend'),
