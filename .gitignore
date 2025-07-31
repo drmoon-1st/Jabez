@@ -20,6 +20,5 @@ golf/fusion/embedding_data/timesformer/*
 golf/fusion/embbeding_data/timesformer/*
 !golf/fusion/embbeding_data/timesformer/
 
-golf/fusion/fusion_images/*
-golf/fusion/fusion_images/
+golf/fusion/fusion_images
 
