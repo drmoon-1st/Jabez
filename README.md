@@ -38,7 +38,12 @@ and combines them to train an MLP.
                               ┌───────────────────────────┐
                               │   Output: Good / Bad      │
                               └───────────────────────────┘
-``` 
+```
+
+# Environment Setting
+도커로 제공 준비중...  
+Under development in Docker...  
+
   
 # Code Structure  
 ### Data Preprocessing
