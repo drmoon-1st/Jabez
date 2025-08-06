@@ -6,6 +6,8 @@ golf/Timesformer_finetune/checkpoint.pth
 
 golf/Timesformer_finetune/epochs
 
+golf/Timesformer_finetune/finetuned_model
+
 golf/fusion/embedding_data/stgcnpp/*
 !golf/fusion/embedding_data/stgcnpp/
 
