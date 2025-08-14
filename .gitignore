@@ -8,6 +8,8 @@ golf/Timesformer_finetune/epochs
 
 golf/Timesformer_finetune/finetuned_model
 
+golf/Timesformer_finetune/best_timesformer.pth
+
 golf/fusion/embedding_data/stgcnpp/*
 !golf/fusion/embedding_data/stgcnpp/
 
