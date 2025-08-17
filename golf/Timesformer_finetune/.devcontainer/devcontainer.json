@@ -1,0 +1,17 @@
+{
+  "name": "timesformer-dev",
+  "dockerComposeFile": ["../../../../docker-compose.yml"],
+  "service": "timesformer",
+  "workspaceFolder": "/workspace/golf/Timesformer_finetune",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-toolsai.jupyter"],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/timesformer/bin/python"
+      }
+    }
+  },
+  "runServices": ["timesformer"],
+  "shutdownAction": "stopCompose"
+}

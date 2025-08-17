@@ -1,0 +1,42 @@
+version: "3.8"
+
+x-common: &common
+  runtime: nvidia
+  deploy:
+    resources:
+      reservations:
+        devices: [{ capabilities: ["gpu"] }]
+  shm_size: "16gb"
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=all
+    - TZ=Asia/Seoul
+  volumes:
+    - D:\golfDataset:/workspace/data:rw
+    - ./:/workspace:rw
+  working_dir: /workspace
+
+services:
+  mmaction:
+    <<: *common
+    build:
+      context: .
+      dockerfile: containers/mmaction/Dockerfile
+    image: local/mmaction:locked
+    command: sleep infinity
+
+  timesformer:
+    <<: *common
+    build:
+      context: .
+      dockerfile: containers/timesformer/Dockerfile
+    image: local/timesformer:locked
+    command: sleep infinity
+
+  classifier_fusion:
+    <<: *common
+    build:
+      context: .
+      dockerfile: containers/classifier_fusion/Dockerfile
+    image: local/classifier_fusion:locked
+    command: sleep infinity

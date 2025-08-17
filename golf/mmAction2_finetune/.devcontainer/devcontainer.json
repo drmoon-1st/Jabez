@@ -1,0 +1,17 @@
+{
+  "name": "mmaction-dev",
+  "dockerComposeFile": ["../../../../docker-compose.yml"],
+  "service": "mmaction",
+  "workspaceFolder": "/workspace/golf/mmAction2_finetune",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-toolsai.jupyter"],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/mmaction/bin/python"
+      }
+    }
+  },
+  "runServices": ["mmaction"],
+  "shutdownAction": "stopCompose"
+}

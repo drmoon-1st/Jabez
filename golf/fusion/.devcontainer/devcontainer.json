@@ -1,0 +1,17 @@
+{
+  "name": "classifier_fusion-dev",
+  "dockerComposeFile": ["../../../../docker-compose.yml"],
+  "service": "classifier_fusion",
+  "workspaceFolder": "/workspace/golf/fusion",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "ms-toolsai.jupyter"],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/classifier_fusion/bin/python"
+      }
+    }
+  },
+  "runServices": ["classifier_fusion"],
+  "shutdownAction": "stopCompose"
+}
