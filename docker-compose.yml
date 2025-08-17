@@ -11,19 +11,19 @@ x-common: &common
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
     - TZ=Asia/Seoul
-  volumes:
-    - D:\golfDataset:/workspace/data:rw
-    - ./:/workspace:rw
   working_dir: /workspace
 
 services:
   mmaction:
     <<: *common
     build:
-      context: .
+      context: .                       # D:\Jabez
       dockerfile: containers/mmaction/Dockerfile
     image: local/mmaction:locked
     command: sleep infinity
+    volumes:
+      - "D:\\mmaction2:/workspace/mmaction2:rw"     # 코드 레포 마운트
+      - "D:\\golfDataset:/workspace/data:rw"        # 데이터 루트
 
   timesformer:
     <<: *common
@@ -32,11 +32,16 @@ services:
       dockerfile: containers/timesformer/Dockerfile
     image: local/timesformer:locked
     command: sleep infinity
-
+    volumes:
+      - "D:\\TimeSformer:/workspace/TimeSformer:rw" # 코드 레포 마운트
+      - "D:\\golfDataset:/workspace/data:rw"
   classifier_fusion:
     <<: *common
     build:
-      context: .
+      context: .                                   # D:\Jabez
       dockerfile: containers/classifier_fusion/Dockerfile
     image: local/classifier_fusion:locked
     command: sleep infinity
+    volumes:
+      - "D:\\Jabez:/workspace:rw"                  # ★ Jabez 전체를 /workspace 로
+      - "D:\\golfDataset:/workspace/data:rw"       # 데이터 루트 (필요 시 경로 수정)

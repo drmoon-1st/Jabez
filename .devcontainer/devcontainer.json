@@ -1,0 +1,20 @@
+{
+  "name": "classifier-fusion-dev",
+  "dockerComposeFile": ["./docker-compose.yml"],   // 같은 폴더에 있으므로 상대경로
+  "service": "classifier_fusion",
+  "workspaceFolder": "/workspace",                 // D:\Jabez 전체가 /workspace
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/classifier_fusion/bin/python"
+      }
+    }
+  },
+  "runServices": ["classifier_fusion"],
+  "shutdownAction": "stopCompose"
+}
