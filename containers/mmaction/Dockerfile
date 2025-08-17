@@ -11,7 +11,9 @@ COPY docker/mmaction-pip.txt      /tmp/mmaction-pip.txt
 
 RUN mamba create -y -n mmaction --file /tmp/mmaction-explicit.txt && conda clean -a -y
 SHELL ["/bin/bash","-lc"]
-RUN conda run -n mmaction pip install --no-cache-dir -r /tmp/mmaction-pip.txt
+RUN conda run -n mmaction pip install --no-cache-dir -r /tmp/mmaction-pip.txt \
+	&& conda run -n mmaction pip install -U openmim \
+	&& conda run -n mmaction mim install mmcv==2.1.0
 
 RUN echo "conda activate mmaction" >> /root/.bashrc
 ENV TZ=Asia/Seoul
