@@ -1,0 +1,8 @@
+numpy
+pandas
+opencv-python
+tqdm
+scikit-learn
+pyrealsense2
+plotly
+pathlib

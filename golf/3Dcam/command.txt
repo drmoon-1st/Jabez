@@ -1,0 +1,6 @@
+python rs_realsense_openpose_record2csv.py --output output --duration 5
+# 5초 동안 캡쳐
+
+python rs_realsense_openpose_record2csv.py --output output --interactive
+# q누르면 녹화종료
+
