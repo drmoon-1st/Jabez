@@ -1,0 +1,6 @@
+opencv-python
+pyyaml
+#pyrealsense2
+mediapipe
+pandas
+numpy

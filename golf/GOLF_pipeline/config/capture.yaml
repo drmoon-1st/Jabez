@@ -1,0 +1,30 @@
+# === RealSense Streams ===
+color:
+  width: 848
+  height: 480
+  fps: 60
+depth:
+  width: 848
+  height: 480
+  fps: 60
+
+# === Output paths ===
+out_dir: "/Users/ihyeonjun/Documents/golf_anal/output"   # macOS 예시(리눅스는 /home/ubuntu/...로 교체)
+
+# 하위 생성물 (out_dir 아래)
+subdirs:
+  color: "color"          # PNG
+  depth: "depth"          # NPY (mm)
+  openpose_json: "openpose_json"  # (선택) OpenPose 결과 저장 폴더
+files:
+  intrinsics: "intrinsics.json"
+  csv_2d3d: "skeleton2d3d.csv"     # 2D+Depth→3D 조합 CSV (원하면 활성화)
+
+# === 녹화 모드 ===
+mode: "interactive"   # "interactive" | "duration"
+duration_sec: 5
+
+# === 포즈 추출 방식 ===
+pose:
+  backend: "mediapipe"   # "mediapipe" | "openpose" | "none"
+  # openpose 사용 시: exe_path, model, hand/face 등 옵션 추가 가능

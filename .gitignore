@@ -29,3 +29,6 @@ golf/fusion/embbeding_data/timesformer/*
 golf/fusion/fusion_images
 
 golf/3Dcam/output
+
+golf/GOLF_pipeline/.venv/
+golf/GOLF_pipeline/summary

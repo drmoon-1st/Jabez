@@ -1,0 +1,33 @@
+# 입력(캡처 산출물)
+img_dir: "/Users/ihyeonjun/Documents/golf_anal/output/color"
+csv_path: "/Users/ihyeonjun/Documents/golf_anal/output/skeleton3d_only_normalized_xyz.csv"
+
+# 메트릭 결과
+metrics_csv: "/Users/ihyeonjun/Documents/golf_anal/summary/metrics.csv"
+
+# 오버레이 영상 (선택)
+make_overlay: true
+overlay_mp4: "/Users/ihyeonjun/Documents/golf_anal/summary/output.mp4"
+fps: 30
+codec: "mp4v"
+
+# HUD/스켈레톤 표시 옵션
+draw:
+  skeleton:
+    line_bgr: [0,255,255]   # 노란색 선
+    line_thick: 1
+    dot_bgr: [0,0,255]      # 빨간색 점
+    dot_radius: 2
+  hud:
+    font_scale: 0.4
+    thickness: 1
+    color_bgr: [0,255,0]    # 초록색 글자
+
+landmarks:
+  head: "Nose"           # CSV가 Nose__x / Nose__y / Nose__z 라면 이렇게
+  shoulder_left: "LShoulder"
+  shoulder_right: "RShoulder"
+  hip_left: "LHip"
+  hip_right: "RHip"
+  wrist_left: "LWrist"
+  wrist_right: "RWrist"
