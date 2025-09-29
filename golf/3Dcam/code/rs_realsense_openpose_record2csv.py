@@ -191,12 +191,19 @@ def run_openpose_on_image_dir(image_dir: Path, json_out_dir: Path):
         raise RuntimeError(f"OpenPose 실패\nstdout:\n{res.stdout}\n\nstderr:\n{res.stderr}")
 
 # ================= 3) JSON+Depth -> 2D+3D CSV =================
-def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Path, out_csv: Path):
+def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Path, out_dir: Path):
+    """
+    Process OpenPose JSON + depth files and write two CSVs into out_dir:
+      - skeleton2d.csv : only 2D columns (COLS_2D)
+      - skeleton3d.csv : only 3D columns (COLS_3D)
+    Each row corresponds to one frame and preserves ordering.
+    """
     with open(intrinsics_json, "r", encoding="utf-8") as f:
         intr_full = json.load(f)
     intr = intr_full["color_intrinsics"]
 
-    rows = []
+    rows2d = []
+    rows3d = []
     json_files = sorted(json_dir.glob("*.json"))
     if not json_files:
         raise FileNotFoundError(f"No OpenPose JSON in {json_dir}")
@@ -210,7 +217,8 @@ def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Pat
         data = json.load(open(jf, "r"))
         people = data.get("people", [])
         if not people:
-            rows.append([np.nan] * (len(COLS_2D) + len(COLS_3D)))
+            rows2d.append([np.nan] * len(COLS_2D))
+            rows3d.append([np.nan] * len(COLS_3D))
             continue
 
         kps = np.array(people[0]["pose_keypoints_2d"]).reshape(-1, 3)
@@ -224,10 +232,22 @@ def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Pat
             X, Y, Zm = deproject_xyZ_to_XYZ(x, y, Z, intr)
             row_3d.extend([X, Y, Zm])
 
-        rows.append(row_2d + row_3d)
+        # If kps_17 had fewer than expected joints, pad with NaNs to keep column sizes stable
+        if len(row_2d) < len(COLS_2D):
+            row_2d.extend([np.nan] * (len(COLS_2D) - len(row_2d)))
+        if len(row_3d) < len(COLS_3D):
+            row_3d.extend([np.nan] * (len(COLS_3D) - len(row_3d)))
 
-    pd.DataFrame(rows, columns=(COLS_2D + COLS_3D)).to_csv(out_csv, index=False)
-    print(f"[SAVE] 2D+3D CSV -> {out_csv}")
+        rows2d.append(row_2d)
+        rows3d.append(row_3d)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out2d = out_dir / "skeleton2d.csv"
+    out3d = out_dir / "skeleton3d.csv"
+    pd.DataFrame(rows2d, columns=COLS_2D).to_csv(out2d, index=False)
+    pd.DataFrame(rows3d, columns=COLS_3D).to_csv(out3d, index=False)
+    print(f"[SAVE] 2D CSV -> {out2d}")
+    print(f"[SAVE] 3D CSV -> {out3d}")
 
 # ================= CLI =================
 def main():
@@ -257,9 +277,8 @@ def main():
     json_dir = out_dir / "openpose_json"
     run_openpose_on_image_dir(color_dir, json_dir)
 
-    # 3) 2D+3D CSV
-    out_csv = out_dir / "skeleton2d3d.csv"
-    json_depth_to_2d3d_csv(json_dir, depth_dir, intr_json, out_csv)
+    # 3) 2D CSV + 3D CSV
+    json_depth_to_2d3d_csv(json_dir, depth_dir, intr_json, out_dir)
 
 if __name__ == "__main__":
     main()

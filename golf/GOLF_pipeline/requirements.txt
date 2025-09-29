@@ -1,6 +1,6 @@
 opencv-python
 pyyaml
-#pyrealsense2
+pyrealsense2
 mediapipe
 pandas
 numpy
