@@ -34,3 +34,4 @@ golf/GOLF_pipeline/.venv/
 golf/GOLF_pipeline/summary
 
 golf/3Dcam/.venv/
+golf/3Dcam/realsense_pack_and_upload.config.json
