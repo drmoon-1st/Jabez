@@ -526,6 +526,8 @@ def build_gui():
     server_var = StringVar(value=cfg.get('server_base', 'http://127.0.0.1:5000'))
     object_var = StringVar(value=cfg.get('last_object_name', 'realsense_package'))
     status_var = StringVar(value="Idle")
+    from tkinter import BooleanVar
+    zip_var = BooleanVar(value=True)
 
     recorder = {"obj": None}
 
@@ -555,6 +557,8 @@ def build_gui():
     obj_entry = ttk.Entry(mid, textvariable=object_var)
     obj_entry.grid(row=2, column=1, sticky='ew', padx=6, pady=(8,0))
     Label(mid, text="예: videos/session1 (업로드될 S3 키의 prefix)", fg='gray').grid(row=3, column=1, sticky='w', padx=6, pady=(2,0))
+    # Option: package everything into a single ZIP and upload (recommended for session atomicity)
+    ttk.Checkbutton(mid, text="Package as ZIP (recommended)", variable=zip_var).grid(row=4, column=1, sticky='w', padx=6, pady=(6,0))
     # Server field and Get Presigned button to the right
     right = ttk.Frame(mid)
     right.grid(row=0, column=2, rowspan=2, sticky='ne', padx=(8,0))
@@ -675,6 +679,65 @@ def build_gui():
                 upload_btn.config(state='normal')
                 return
             base_obj = object_var.get().strip() or f"realsense_package_{int(time.time())}"
+            # If zip_var is set, package into a single ZIP and upload that instead (recommended)
+            if zip_var.get():
+                try:
+                    status_var.set('Creating ZIP package...')
+                    root.update_idletasks()
+                    zip_name = f"{base_obj.replace('/', '_')}.zip"
+                    zip_path = outp.parent / zip_name
+                    # create zip in parent of output to avoid including parent path in archive
+                    zip_dir(outp, zip_path)
+                    status_var.set('Requesting presigned URL for ZIP...')
+                    root.update_idletasks()
+                    ok, pres = get_presigned_url_for_file(sb, f"{base_obj}.zip")
+                    if not ok:
+                        # write log
+                        ts = int(time.time())
+                        log_path = outp / f"presign_error_{ts}.log"
+                        with open(log_path, 'w', encoding='utf-8') as lf:
+                            lf.write(f"Presign failure for ZIP: {zip_path}\n")
+                            lf.write(f"Message: {pres}\n")
+                        show_native_error('Presign failed', f'Presign for ZIP failed\n\n{pres}\n\nLog: {log_path}')
+                        status_var.set('Presign failed for ZIP')
+                        start_btn.config(state='normal')
+                        stop_btn.config(state='disabled')
+                        upload_btn.config(state='normal')
+                        return
+                    # upload zip
+                    status_var.set('Uploading ZIP...')
+                    root.update_idletasks()
+                    # pres may be dict or url
+                    url_obj = pres
+                    ok2, msg2, details = upload_file_presigned(url_obj, zip_path, status_callback=lambda s: status_var.set(s), content_type='application/zip')
+                    if not ok2:
+                        ts = int(time.time())
+                        log_path = outp / f"upload_error_{ts}.log"
+                        with open(log_path, 'w', encoding='utf-8') as lf:
+                            lf.write(f"ZIP upload failed: {zip_path}\n")
+                            lf.write(f"Message: {msg2}\n\n")
+                            lf.write(json.dumps(details, ensure_ascii=False, indent=2))
+                        show_native_error('ZIP upload failed', f'ZIP upload failed\n\n{msg2}\n\nLog: {log_path}')
+                        status_var.set('ZIP upload failed')
+                        start_btn.config(state='normal')
+                        stop_btn.config(state='disabled')
+                        upload_btn.config(state='normal')
+                        return
+                    else:
+                        status_var.set('ZIP upload succeeded')
+                        ok_count = 1
+                        status_var.set(f'Upload finished: {ok_count}/1 success')
+                        start_btn.config(state='normal')
+                        stop_btn.config(state='disabled')
+                        upload_btn.config(state='normal')
+                        return
+                except Exception as e:
+                    status_var.set(f'ZIP packaging/upload error: {e}')
+                    start_btn.config(state='normal')
+                    stop_btn.config(state='disabled')
+                    upload_btn.config(state='normal')
+                    return
+
             status_var.set(f'Uploading {len(files)} files...')
             results = upload_files_individually(sb, base_obj, outp, files, workers=4, status_callback=lambda s: status_var.set(s))
 
