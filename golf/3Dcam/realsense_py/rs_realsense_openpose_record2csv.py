@@ -22,6 +22,8 @@ import pandas as pd
 import cv2
 from tqdm import tqdm
 import pyrealsense2 as rs
+# interpolation utilities (local)
+from interpolation import mask_sentinel_and_confidence, interpolate_df
 
 # ================= 사용자 환경 설정 =================
 OPENPOSE_EXE  = Path(r"C:/openpose/openpose/bin/OpenPoseDemo.exe")  # OpenPoseDemo.exe 경로
@@ -249,10 +251,55 @@ def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Pat
     print(f"[SAVE] 2D CSV -> {out2d}")
     print(f"[SAVE] 3D CSV -> {out3d}")
 
+    # Post-process: optional interpolation (mask sentinel and low-confidence)
+    # The CLI flags for interpolation are handled in main(); we use a function attribute
+    try:
+        interp_opts = json_depth_to_2d3d_csv._interp_opts
+    except AttributeError:
+        interp_opts = None
+
+    if interp_opts:
+        s2 = out2d
+        s3 = out3d
+        df2 = pd.read_csv(s2)
+        df3 = pd.read_csv(s3)
+        conf_thresh = float(interp_opts.get('conf_thresh', 0.0))
+        limit = interp_opts.get('limit', None)
+        fill_method = interp_opts.get('fill_method', 'none')
+
+        print(f"[INTERP] masking sentinel/conf_th={conf_thresh} and interpolating...")
+        df2m, df3m = mask_sentinel_and_confidence(df2, df3, conf_thresh=conf_thresh)
+        df2i = interpolate_df(df2m, method='linear', limit_direction='both', limit=limit)
+        df3i = interpolate_df(df3m, method='linear', limit_direction='both', limit=limit)
+
+        if fill_method != 'none':
+            if fill_method == 'zero':
+                df2i = df2i.fillna(0.0)
+                df3i = df3i.fillna(0.0)
+            else:
+                df2i = df2i.fillna(method=fill_method, limit=None)
+                df3i = df3i.fillna(method=fill_method, limit=None)
+
+        out2i = out_dir / (out2d.stem + '_interp' + out2d.suffix)
+        out3i = out_dir / (out3d.stem + '_interp' + out3d.suffix)
+        df2i.to_csv(out2i, index=False)
+        df3i.to_csv(out3i, index=False)
+        print(f"[SAVE] 2D CSV (interp) -> {out2i}")
+        print(f"[SAVE] 3D CSV (interp) -> {out3i}")
+
 # ================= CLI =================
 def main():
     parser = argparse.ArgumentParser(description="RealSense 녹화 → OpenPose(1회) → 2D+3D CSV")
-    parser.add_argument("--output", required=True, type=str, help="출력 폴더")
+    parser.add_argument("--output", required=True, type=str, help="출력 베이스 폴더 (새 녹화마다 하위 폴더 생성)")
+    parser.add_argument("--session-prefix", type=str, default="swing", help="세션 폴더 접두사 (예: swing → swing1, swing2, ...)")
+    parser.add_argument("--conf-thresh", type=float, default=0.0,
+                        help="(optional) confidence threshold below which keypoints are treated as missing (0-1). Default: 0 = disabled")
+    parser.add_argument("--interp", action="store_true",
+                        help="생성된 CSV에 대해 선형 보간(interpolate) 및 마스킹을 적용하고 _interp 파일을 생성합니다")
+    parser.add_argument("--interp-limit", type=int, default=None,
+                        help="연속 NaN 최대 보간 길이 (None = 무제한)")
+    parser.add_argument("--interp-fill", type=str, default='none', choices=['none','ffill','bfill','nearest','zero'],
+                        help='보간 후 남은 NaN 처리 방법 (none, ffill, bfill, nearest, zero)')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--duration", type=float, help="녹화 시간(초)")
     group.add_argument("--interactive", action="store_true", help="미리보기 창에서 'q'로 시작/종료, ESC로 즉시 종료")
@@ -260,8 +307,21 @@ def main():
     args = parser.parse_args()
     assert_openpose()
 
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    base_out = Path(args.output)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    # Create a new session folder under base_out with a timestamp to ensure uniqueness
+    prefix = args.session_prefix
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    session_name = f"{prefix}_{ts}"
+    out_dir = base_out / session_name
+    # If a collision somehow occurs (very unlikely), append a small counter
+    cnt = 1
+    while out_dir.exists():
+        out_dir = base_out / f"{session_name}_{cnt}"
+        cnt += 1
+    out_dir.mkdir(parents=True, exist_ok=False)
+    print(f"새 세션 폴더 생성: {out_dir}")
 
     # 1) 녹화
     color_dir, depth_dir, intr_json = capture_rgbd_to_dir(
@@ -278,6 +338,18 @@ def main():
     run_openpose_on_image_dir(color_dir, json_dir)
 
     # 3) 2D CSV + 3D CSV
+    # If --interp was requested, pass options via a temporary attribute
+    if getattr(args, 'interp', False):
+        json_depth_to_2d3d_csv._interp_opts = {
+            'conf_thresh': float(getattr(args, 'conf_thresh', 0.0)),
+            'limit': args.interp_limit,
+            'fill_method': args.interp_fill,
+        }
+    else:
+        # ensure no leftover attribute
+        if hasattr(json_depth_to_2d3d_csv, '_interp_opts'):
+            delattr(json_depth_to_2d3d_csv, '_interp_opts')
+
     json_depth_to_2d3d_csv(json_dir, depth_dir, intr_json, out_dir)
 
 if __name__ == "__main__":
