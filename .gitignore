@@ -33,7 +33,9 @@ golf/3Dcam/output
 golf/GOLF_pipeline/.venv/
 golf/GOLF_pipeline/summary
 
-golf/3Dcam/.venv/
 golf/3Dcam/S3_connect/.venv/
+golf/3Dcam/S3_connect/dist/
+golf/3Dcam/S3_connect/build/
+golf/3Dcam/S3_connect/output/
 golf/3Dcam/S3_connect/realsense_pack_and_upload.config.json
 golf/3Dcam/realsense_py/output/
