@@ -579,12 +579,16 @@ def build_gui():
             # data may be a string URL or a dict {url, required_headers}
             if isinstance(data, dict):
                 url_var.set(data.get('url'))
-                cfg['last_presigned_url_details'] = data
-                cfg['last_presigned_url'] = data.get('url')
+                # Do NOT persist the full presigned URL to disk. It is temporary and may
+                # become invalid; storing it causes stale uploads when server IPs or
+                # presigns change. Only keep server_base and object name.
+                # cfg['last_presigned_url_details'] = data  # intentionally not saved
+                # cfg['last_presigned_url'] = data.get('url')  # intentionally not saved
             else:
                 url_var.set(data)
-                cfg['last_presigned_url'] = data
+                # do not persist presigned URL
             status_var.set('Presigned URL received')
+            # persist only server and object convenience values
             cfg['server_base'] = sb
             cfg['last_object_name'] = obj
             save_config(cfg)
