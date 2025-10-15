@@ -1,134 +1,356 @@
+# rs_realsense_openpose_record2csv.py
+"""
+Intel RealSense -> RGB/Depth 녹화 -> OpenPose(1회) -> 2D+3D CSV 생성
+
+사용 예)
+1) 시간 지정 녹화 (예: 5초)
+   python rs_realsense_openpose_record2csv.py --output output --duration 5
+
+2) 인터랙티브 녹화 (RGB 미리보기 창에서 'q'로 시작/종료)
+   python rs_realsense_openpose_record2csv.py --output output --interactive
+"""
+
 import os
 import json
-import base64
 import time
 import argparse
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pandas as pd
+import cv2
 from tqdm import tqdm
-import requests
+import pyrealsense2 as rs
+# interpolation utilities (local)
+from interpolation import mask_sentinel_and_confidence, interpolate_df
 
 # ================= 사용자 환경 설정 =================
-# OpenPose API 엔드포인트. WSL 환경에서 Docker 컨테이너가 19030 포트로 실행 중임을 가정.
-API_URL = "http://localhost:19030/openpose_predict" 
+OPENPOSE_EXE  = Path(r"C:/openpose/openpose/bin/OpenPoseDemo.exe")  # OpenPoseDemo.exe 경로
+OPENPOSE_ROOT = OPENPOSE_EXE.parent.parent
+MODEL_FOLDER  = OPENPOSE_ROOT / "models"                             # .../openpose/models
+COCO_MODEL    = MODEL_FOLDER / "pose/coco/pose_iter_440000.caffemodel"
+# RealSense 캡처 해상도/FPS
+IMG_W, IMG_H, FPS = 640, 480, 30
 
-# COCO17 타깃 컬럼 순서 (2D 키포인트만)
+# COCO17 타깃 컬럼 순서 (2D/3D 모두 이 순서를 따름)
 KP_17 = [
     "Nose", "LEye", "REye", "LEar", "REar",
     "LShoulder", "RShoulder", "LElbow", "RElbow",
     "LWrist", "RWrist", "LHip", "RHip",
     "LKnee", "RKnee", "LAnkle", "RAnkle"
 ]
-COLS_2D = [f"{n}_{a}" for n in KP_17 for a in ("x", "y", "c")]
+COLS_2D = [f"{n}_{a}" for n in KP_17 for a in ("x","y","c")]
+COLS_3D = [f"{n}_{a}" for n in KP_17 for a in ("X3D","Y3D","Z3D")]
 
 # OpenPose COCO 출력(18개, Neck 포함 가능) -> 위 KP_17 순서로 재배열
 _IDX_MAP_18_TO_17 = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
 
 # ================= 유틸 =================
-def encode_image_to_base64(image_path: Path):
-    """이미지 파일을 Base64 문자열로 인코딩합니다."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+def assert_openpose():
+    assert OPENPOSE_EXE.exists(), f"OpenPoseDemo.exe 없음: {OPENPOSE_EXE}"
+    assert COCO_MODEL.exists(), f"COCO 모델 없음: {COCO_MODEL}"
 
-def call_openpose_api(image_base64: str):
-    """OpenPose Docker API에 POST 요청을 보내고 JSON 응답을 받습니다."""
-    payload = {
-        "img": image_base64,
-        "turbo_without_skeleton": True # 결과 이미지 대신 데이터 처리 속도 우선
-    }
-    headers = {'Content-Type': 'application/json'}
-    
-    # RunPod과 같이 시간이 오래 걸릴 수 있으므로 타임아웃을 넉넉하게 설정
+def robust_depth_from_patch(depth_m: np.ndarray, x: int, y: int, r: int = 2) -> float:
+    H, W = depth_m.shape
+    x0, x1 = max(0, x-r), min(W, x+r+1)
+    y0, y1 = max(0, y-r), min(H, y+r+1)
+    patch = depth_m[y0:y1, x0:x1]
+    vals = patch[np.isfinite(patch) & (patch > 0)]
+    return float(np.median(vals)) if vals.size else np.nan
+
+def deproject_xyZ_to_XYZ(x: float, y: float, Z: float, intr: dict):
+    if not (Z > 0 and np.isfinite(Z)):
+        return (np.nan, np.nan, np.nan)
+    X = (x - intr["cx"]) * Z / intr["fx"]
+    Y = (y - intr["cy"]) * Z / intr["fy"]
+    return (float(X), float(Y), float(Z))
+
+# ================= 1) RealSense 캡처 =================
+def capture_rgbd_to_dir(output_dir: Path, duration_sec: float = None, interactive: bool = False):
+    """
+    RealSense에서 RGB/Depth 캡처.
+    - color/*.png, depth/*.npy 저장 (depth는 미터 float32)
+    - intrinsics.json 저장
+    - duration_sec 지정 or interactive 모드('q'로 시작/종료, ESC로 즉시 종료)
+    """
+    color_dir = output_dir / "color"
+    depth_dir = output_dir / "depth"
+    color_dir.mkdir(parents=True, exist_ok=True)
+    depth_dir.mkdir(parents=True, exist_ok=True)
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, IMG_W, IMG_H, rs.format.z16, FPS)
+    config.enable_stream(rs.stream.color, IMG_W, IMG_H, rs.format.bgr8, FPS)
+    align = rs.align(rs.stream.color)
+
+    profile = pipeline.start(config)
     try:
-        response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=60) 
-        response.raise_for_status() 
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"\n[ERROR] API 호출 실패: {e}")
-        return None
+        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_scale = depth_sensor.get_depth_scale()
+        intr = None
 
-# ================= 메인 처리 함수 =================
-def process_images_to_2d_csv(image_dir: Path, output_dir: Path):
-    """이미지 디렉토리의 모든 프레임을 API로 처리하고 2D CSV를 생성합니다."""
-    image_files = sorted([f for f in image_dir.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg']])
-    if not image_files:
-        print(f"[WARN] 처리할 이미지가 '{image_dir}'에 없습니다. 종료합니다.")
-        return
+        t0 = time.time()
+        idx = 0  # 저장된 프레임 인덱스(녹화 시에만 증가)
+
+        win = None
+        is_recording = False
+        if interactive:
+            win = "RealSense RGB (press 'q' to START/STOP, ESC to exit)"
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+        pbar = tqdm(desc="Capturing RGB-D", unit="fr")
+        while True:
+            frames = pipeline.wait_for_frames()
+            frames = align.process(frames)
+            depth = frames.get_depth_frame()
+            color = frames.get_color_frame()
+            if not depth or not color:
+                continue
+
+            if intr is None:
+                ci = color.profile.as_video_stream_profile().intrinsics
+                intr = {
+                    "width": ci.width, "height": ci.height,
+                    "fx": ci.fx, "fy": ci.fy, "cx": ci.ppx, "cy": ci.ppy,
+                    "coeffs": list(ci.coeffs),
+                }
+                meta = {"fps": FPS, "width": IMG_W, "height": IMG_H, "depth_scale": float(depth_scale)}
+                with open(output_dir / "intrinsics.json", "w", encoding="utf-8") as f:
+                    json.dump({"color_intrinsics": intr, "meta": meta}, f, indent=2)
+
+            color_img = np.asanyarray(color.get_data())
+            depth_raw = np.asanyarray(depth.get_data())
+            depth_m = (depth_raw.astype(np.float32) * depth_scale)
+
+            # 인터랙티브: 미리보기 + 키 처리
+            if interactive and win is not None:
+                disp = color_img.copy()
+                if is_recording:
+                    cv2.putText(disp, f"REC [{idx}]", (10, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    cv2.putText(disp, "Press 'q' to STOP", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (20, 220, 20), 2)
+                else:
+                    cv2.putText(disp, "Press 'q' to START", (10, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 220, 20), 2)
+                    cv2.putText(disp, "ESC to exit", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.imshow(win, disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC
+                    # 즉시 종료 (녹화 중이든 아니든)
+                    break
+                elif key == ord('q'):
+                    # 토글
+                    is_recording = not is_recording
+                    if not is_recording:
+                        # STOP → 루프 종료하고 후처리 진행
+                        break
+
+            # 저장은 "녹화 중"에만 수행 (duration 모드는 항상 저장)
+            if (interactive and is_recording) or ((not interactive) and (duration_sec is not None)):
+                cv2.imwrite(str(color_dir / f"{idx:06d}.png"), color_img)
+                np.save(depth_dir / f"{idx:06d}.npy", depth_m)
+                idx += 1
+                pbar.update(1)
+
+            # duration 모드: 시간이 다 되면 종료
+            if (not interactive) and (duration_sec is not None) and ((time.time() - t0) >= duration_sec):
+                break
+
+        pbar.close()
+
+    finally:
+        pipeline.stop()
+        if interactive:
+            cv2.destroyAllWindows()
+
+    return color_dir, depth_dir, output_dir / "intrinsics.json"
+
+# ================= 2) OpenPose 1회 실행 =================
+def run_openpose_on_image_dir(image_dir: Path, json_out_dir: Path):
+    img_dir_abs  = Path(image_dir).resolve()
+    json_dir_abs = Path(json_out_dir).resolve()
+    json_dir_abs.mkdir(parents=True, exist_ok=True)
+
+    if not img_dir_abs.exists():
+        raise FileNotFoundError(f"Image dir not found: {img_dir_abs}")
+
+    cmd = [
+        str(OPENPOSE_EXE),
+        "--image_dir", str(img_dir_abs),
+        "--write_json", str(json_dir_abs),
+        "--display", "0", "--render_pose", "0",
+        "--number_people_max", "1",
+        "--model_folder", str(MODEL_FOLDER.resolve()),
+        "--model_pose", "COCO",
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=OPENPOSE_ROOT, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"OpenPose 실패\nstdout:\n{res.stdout}\n\nstderr:\n{res.stderr}")
+
+# ================= 3) JSON+Depth -> 2D+3D CSV =================
+def json_depth_to_2d3d_csv(json_dir: Path, depth_dir: Path, intrinsics_json: Path, out_dir: Path):
+    """
+    Process OpenPose JSON + depth files and write two CSVs into out_dir:
+      - skeleton2d.csv : only 2D columns (COLS_2D)
+      - skeleton3d.csv : only 3D columns (COLS_3D)
+    Each row corresponds to one frame and preserves ordering.
+    """
+    with open(intrinsics_json, "r", encoding="utf-8") as f:
+        intr_full = json.load(f)
+    intr = intr_full["color_intrinsics"]
 
     rows2d = []
-    
-    for image_path in tqdm(image_files, desc="Processing Frames (API Call)", unit="fr"):
-        try:
-            # 1. Base64 인코딩
-            encoded_img = encode_image_to_base64(image_path)
-            
-            # 2. API 호출
-            data = call_openpose_api(encoded_img)
-            
-            if data is None:
-                # API 호출 실패 시 해당 프레임은 NaN으로 채움
-                rows2d.append([np.nan] * len(COLS_2D))
-                continue
+    rows3d = []
+    json_files = sorted(json_dir.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No OpenPose JSON in {json_dir}")
 
-            people = data.get("pose_id", []) # API에 따라 'pose_id'에 키포인트 데이터가 들어있다고 가정
-            
-            # API 응답에서 키포인트 데이터를 찾고, 형식을 검사
-            if not isinstance(people, list) or not people:
-                 # 사람이 탐지되지 않거나, 데이터 형식이 잘못된 경우
-                rows2d.append([np.nan] * len(COLS_2D))
-                continue
+    for idx, jf in enumerate(tqdm(json_files, desc="2D+Depth -> 3D", unit="fr")):
+        depth_path = depth_dir / f"{idx:06d}.npy"
+        if not depth_path.exists():
+            raise FileNotFoundError(f"Depth not found for frame {idx:06d}.npy in {depth_dir}")
+        depth_m = np.load(depth_path)  # (H,W) meters
 
-            # API는 이미지를 처리하고 키포인트 목록을 반환해야 함.
-            # 이 OpenPose API는 처리된 이미지도 반환하지만, 여기서는 키포인트만 추출합니다.
-            
-            # 첫 번째 사람의 키포인트만 사용 (max_people=1 가정)
-            kps_raw = people[0] 
-            kps = np.array(kps_raw).reshape(-1, 3) # (N, 3) 형태 (x, y, c)
-            
-            # 18개 키포인트를 17개(COCO17)로 재배열
-            kps_17 = kps[_IDX_MAP_18_TO_17, :] if kps.shape[0] >= 18 else kps 
+        data = json.load(open(jf, "r"))
+        people = data.get("people", [])
+        if not people:
+            rows2d.append([np.nan] * len(COLS_2D))
+            rows3d.append([np.nan] * len(COLS_3D))
+            continue
 
-            row_2d = []
-            for (x, y, c) in kps_17:
-                row_2d.extend([float(x), float(y), float(c)])
+        kps = np.array(people[0]["pose_keypoints_2d"]).reshape(-1, 3)
+        kps_17 = kps[_IDX_MAP_18_TO_17, :] if kps.shape[0] >= 18 else kps
 
-            # 컬럼 수 맞추기
-            if len(row_2d) < len(COLS_2D):
-                row_2d.extend([np.nan] * (len(COLS_2D) - len(row_2d)))
+        row_2d, row_3d = [], []
+        for (x, y, c) in kps_17:
+            row_2d.extend([float(x), float(y), float(c)])
+            xi, yi = int(round(x)), int(round(y))
+            Z = robust_depth_from_patch(depth_m, xi, yi, r=2)
+            X, Y, Zm = deproject_xyZ_to_XYZ(x, y, Z, intr)
+            row_3d.extend([X, Y, Zm])
 
-            rows2d.append(row_2d)
+        # If kps_17 had fewer than expected joints, pad with NaNs to keep column sizes stable
+        if len(row_2d) < len(COLS_2D):
+            row_2d.extend([np.nan] * (len(COLS_2D) - len(row_2d)))
+        if len(row_3d) < len(COLS_3D):
+            row_3d.extend([np.nan] * (len(COLS_3D) - len(row_3d)))
 
-        except Exception as e:
-            print(f"\n[ERROR] 프레임 {image_path.name} 처리 중 예외 발생: {e}")
-            rows2d.append([np.nan] * len(COLS_2D)) # 오류 시에도 NaN 추가하여 행렬 유지
-            
-    # 3. CSV로 저장
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out2d = output_dir / "skeleton2d.csv"
+        rows2d.append(row_2d)
+        rows3d.append(row_3d)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out2d = out_dir / "skeleton2d.csv"
+    out3d = out_dir / "skeleton3d.csv"
     pd.DataFrame(rows2d, columns=COLS_2D).to_csv(out2d, index=False)
-    print(f"\n[SAVE] 최종 2D CSV 저장 완료: {out2d}")
-    print(f"총 {len(rows2d)} 프레임 처리됨.")
+    pd.DataFrame(rows3d, columns=COLS_3D).to_csv(out3d, index=False)
+    print(f"[SAVE] 2D CSV -> {out2d}")
+    print(f"[SAVE] 3D CSV -> {out3d}")
 
+    # Post-process: optional interpolation (mask sentinel and low-confidence)
+    # The CLI flags for interpolation are handled in main(); we use a function attribute
+    try:
+        interp_opts = json_depth_to_2d3d_csv._interp_opts
+    except AttributeError:
+        interp_opts = None
+
+    if interp_opts:
+        s2 = out2d
+        s3 = out3d
+        df2 = pd.read_csv(s2)
+        df3 = pd.read_csv(s3)
+        conf_thresh = float(interp_opts.get('conf_thresh', 0.0))
+        limit = interp_opts.get('limit', None)
+        fill_method = interp_opts.get('fill_method', 'none')
+
+        print(f"[INTERP] masking sentinel/conf_th={conf_thresh} and interpolating...")
+        df2m, df3m = mask_sentinel_and_confidence(df2, df3, conf_thresh=conf_thresh)
+        df2i = interpolate_df(df2m, method='linear', limit_direction='both', limit=limit)
+        df3i = interpolate_df(df3m, method='linear', limit_direction='both', limit=limit)
+
+        if fill_method != 'none':
+            if fill_method == 'zero':
+                df2i = df2i.fillna(0.0)
+                df3i = df3i.fillna(0.0)
+            else:
+                df2i = df2i.fillna(method=fill_method, limit=None)
+                df3i = df3i.fillna(method=fill_method, limit=None)
+
+        out2i = out_dir / (out2d.stem + '_interp' + out2d.suffix)
+        out3i = out_dir / (out3d.stem + '_interp' + out3d.suffix)
+        df2i.to_csv(out2i, index=False)
+        df3i.to_csv(out3i, index=False)
+        print(f"[SAVE] 2D CSV (interp) -> {out2i}")
+        print(f"[SAVE] 3D CSV (interp) -> {out3i}")
 
 # ================= CLI =================
 def main():
-    parser = argparse.ArgumentParser(description="Docker OpenPose API를 사용하여 이미지 디렉토리 → 2D CSV 변환")
-    parser.add_argument("--image-dir", required=True, type=str, help="OpenPose로 처리할 이미지 파일들이 있는 폴더 (예: color/)")
-    parser.add_argument("--output", required=True, type=str, help="2D CSV 파일이 저장될 출력 폴더")
+    parser = argparse.ArgumentParser(description="RealSense 녹화 → OpenPose(1회) → 2D+3D CSV")
+    parser.add_argument("--output", required=True, type=str, help="출력 베이스 폴더 (새 녹화마다 하위 폴더 생성)")
+    parser.add_argument("--session-prefix", type=str, default="swing", help="세션 폴더 접두사 (예: swing → swing1, swing2, ...)")
+    parser.add_argument("--conf-thresh", type=float, default=0.0,
+                        help="(optional) confidence threshold below which keypoints are treated as missing (0-1). Default: 0 = disabled")
+    parser.add_argument("--interp", action="store_true",
+                        help="생성된 CSV에 대해 선형 보간(interpolate) 및 마스킹을 적용하고 _interp 파일을 생성합니다")
+    parser.add_argument("--interp-limit", type=int, default=None,
+                        help="연속 NaN 최대 보간 길이 (None = 무제한)")
+    parser.add_argument("--interp-fill", type=str, default='none', choices=['none','ffill','bfill','nearest','zero'],
+                        help='보간 후 남은 NaN 처리 방법 (none, ffill, bfill, nearest, zero)')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--duration", type=float, help="녹화 시간(초)")
+    group.add_argument("--interactive", action="store_true", help="미리보기 창에서 'q'로 시작/종료, ESC로 즉시 종료")
 
     args = parser.parse_args()
+    assert_openpose()
 
-    image_dir = Path(args.image_dir)
-    output_dir = Path(args.output)
-    
-    # 예시: 'color' 폴더가 없으면 에러
-    if not image_dir.is_dir():
-        print(f"[FATAL] 이미지 디렉토리가 유효하지 않습니다: {image_dir}")
+    base_out = Path(args.output)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    # Create a new session folder under base_out with a timestamp to ensure uniqueness
+    prefix = args.session_prefix
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    session_name = f"{prefix}_{ts}"
+    out_dir = base_out / session_name
+    # If a collision somehow occurs (very unlikely), append a small counter
+    cnt = 1
+    while out_dir.exists():
+        out_dir = base_out / f"{session_name}_{cnt}"
+        cnt += 1
+    out_dir.mkdir(parents=True, exist_ok=False)
+    print(f"새 세션 폴더 생성: {out_dir}")
+
+    # 1) 녹화
+    color_dir, depth_dir, intr_json = capture_rgbd_to_dir(
+        out_dir, duration_sec=args.duration, interactive=args.interactive
+    )
+
+    # 저장된 프레임이 하나도 없으면 바로 종료
+    if not any(color_dir.glob("*.png")):
+        print("[WARN] 녹화된 프레임이 없습니다. 종료합니다.")
         return
 
-    process_images_to_2d_csv(image_dir, output_dir)
+    # 2) OpenPose(1회)
+    json_dir = out_dir / "openpose_json"
+    run_openpose_on_image_dir(color_dir, json_dir)
+
+    # 3) 2D CSV + 3D CSV
+    # If --interp was requested, pass options via a temporary attribute
+    if getattr(args, 'interp', False):
+        json_depth_to_2d3d_csv._interp_opts = {
+            'conf_thresh': float(getattr(args, 'conf_thresh', 0.0)),
+            'limit': args.interp_limit,
+            'fill_method': args.interp_fill,
+        }
+    else:
+        # ensure no leftover attribute
+        if hasattr(json_depth_to_2d3d_csv, '_interp_opts'):
+            delattr(json_depth_to_2d3d_csv, '_interp_opts')
+
+    json_depth_to_2d3d_csv(json_dir, depth_dir, intr_json, out_dir)
 
 if __name__ == "__main__":
     main()
