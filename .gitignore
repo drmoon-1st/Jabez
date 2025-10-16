@@ -39,5 +39,4 @@ golf/3Dcam/S3_connect/build/
 golf/3Dcam/S3_connect/output/
 golf/3Dcam/S3_connect/realsense_pack_and_upload.config.json
 golf/3Dcam/realsense_py/output/
-golf/3Dcam/docker-openpose/color/
-golf/3Dcam/docker-openpose/result/raw_responses/
+golf/3Dcam/docker/docker-openpose/color/
