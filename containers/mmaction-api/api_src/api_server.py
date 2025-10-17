@@ -1,6 +1,8 @@
 # api_server.py
 
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 import os
 import sys
 import tempfile
@@ -185,69 +187,59 @@ def extract_stgcn_embedding(crop_csv_path: Path) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------
-# 2. Flask API 설정
+# 2. FastAPI 설정
 # ----------------------------------------------------------------------
 
-app = Flask(__name__)
+app = FastAPI(title="mmaction-stgcn-api")
 
-@app.route('/mmaction_stgcn_embed', methods=['POST'])
-def mmaction_stgcn_embed_endpoint():
-    """
-    Base64 인코딩된 OpenPose CSV를 받아 STGCN 임베딩을 추출하여 반환합니다.
-    요청 형식: {"csv_base64": "..."}
-    """
+
+class CSVBase64Request(BaseModel):
+    csv_base64: str
+
+
+@app.post('/mmaction_stgcn_embed')
+def mmaction_stgcn_embed_endpoint(payload: CSVBase64Request):
+    """Accepts a JSON body with base64-encoded CSV and returns STGCN embedding as JSON."""
+    temp_csv_path = None
     try:
-        if not request.is_json:
-            return jsonify({'error': 'JSON 형식이 필요합니다.'}), 400
-
-        data = request.get_json()
-        csv_base64 = data.get('csv_base64')
-
+        csv_base64 = payload.csv_base64
         if not csv_base64:
-            return jsonify({'error': '키포인트 CSV 데이터(csv_base64)가 누락되었습니다.'}), 400
-        
-        # Base64 디코딩
+            raise HTTPException(status_code=400, detail='csv_base64 is required')
+
         try:
             csv_data = base64.b64decode(csv_base64).decode('utf-8')
         except Exception:
-            return jsonify({'error': 'CSV 데이터 디코딩에 실패했습니다 (Base64 형식 오류).'}), 400
+            raise HTTPException(status_code=400, detail='CSV payload not valid Base64')
 
-        # 임시 파일에 CSV 저장
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp_csv:
             tmp_csv.write(csv_data)
             temp_csv_path = Path(tmp_csv.name)
-            
-        temp_npy_path = temp_csv_path.with_suffix('.npy')
-        
-        print(f"임시 CSV 저장 완료: {temp_csv_path}")
 
-        # STGCN 임베딩 추출 실행
+        print(f"Saved temp CSV: {temp_csv_path}")
+
         embedding = extract_stgcn_embedding(temp_csv_path)
-
-        # 추출된 임베딩을 리스트 형태로 변환
         embedding_list = embedding.tolist()
-        
-        print(f"STGCN 임베딩 추출 완료. 차원: {embedding.shape}")
 
-        # 임시 파일 정리 (NPY는 extract_stgcn_embedding에서 생성되지 않으므로, CSV 파일만 삭제)
-        if temp_csv_path.exists():
-            os.remove(temp_csv_path)
+        print(f"STGCN embedding extracted. shape: {embedding.shape}")
 
-        return jsonify({
+        return JSONResponse(status_code=200, content={
             'message': 'OK',
             'embedding': embedding_list,
             'embedding_dim': len(embedding_list)
-        }), 200
+        })
 
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        print(f"API 처리 중 오류 발생: {str(e)}")
+        print(f"API error: {str(e)}")
         traceback.print_exc()
-        
-        # 오류 발생 시 임시 파일 정리 시도
-        if 'temp_csv_path' in locals() and temp_csv_path.exists():
-            os.remove(temp_csv_path)
-            
-        return jsonify({'error': f'서버 오류: {str(e)}'}), 500
+        raise HTTPException(status_code=500, detail=f'Server error: {str(e)}')
+    finally:
+        if temp_csv_path is not None and temp_csv_path.exists():
+            try:
+                os.remove(temp_csv_path)
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------------

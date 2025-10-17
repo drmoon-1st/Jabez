@@ -23,4 +23,6 @@ EXPOSE 19031
 
 # 5. 컨테이너 시작 시 API 서버 실행
 #    WORKDIR 덕분에 api_server.py 파일만 지정하면 됩니다.
-CMD ["python", "api_server.py"]
+ENV PORT=19031
+# Use uvicorn to run FastAPI app. Bind to 0.0.0.0 and use $PORT with shell form so env var is expanded.
+CMD uvicorn api_server:app --host 0.0.0.0 --port ${PORT}
