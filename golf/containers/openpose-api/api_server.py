@@ -32,8 +32,8 @@ def run_openpose_on_image(image_path, output_json_path, output_img_path=None):
         openpose_bin,
         "--model_folder", "/opt/openpose/models",
         "--write_json", str(output_json_path),
-        "--display", "0",
-        "--render_pose", "1",
+    "--display", "0",
+    "--render_pose", "0",
         "--net_resolution", "-1x208",
         "--output_resolution", "-1x-1",
         "--number_people_max", "1",
@@ -45,8 +45,9 @@ def run_openpose_on_image(image_path, output_json_path, output_img_path=None):
         "--num_gpu", str(num_gpu),
         "--num_gpu_start", str(num_gpu_start)
     ]
-    if output_img_path:
-        base_args += ["--write_images", str(os.path.dirname(output_img_path))]
+    # Only write rendered images if explicitly requested via env var
+    if output_img_path and os.environ.get('OPENPOSE_WRITE_IMAGES', '0') == '1':
+        base_args += ["--write_images", str(os.path.dirname(output_img_path)), "--render_pose", "1"]
 
     # Try common image flags for different OpenPose builds: --image_path or --image_dir
     attempts = []
@@ -282,11 +283,14 @@ async def openpose_predict(req: OpenPoseRequest):
             # pick first person per frame (or empty list)
             sequence = [ (ppl[0] if (ppl and len(ppl) > 0) else []) for ppl in batch_results ]
             interpolated = interpolate_sequence(sequence, conf_thresh=0.0, method='linear', fill_method='none')
+            # Client expects each frame to be a list of people (even if only one person)
+            # so wrap each interpolated person into a list for backward compatibility.
+            people_sequence = [([person] if person else []) for person in interpolated]
             response_payload = {
                 'message': 'OK',
                 'pose_id': None,
-                'people_sequence': interpolated,
-                'frame_count': len(interpolated)
+                'people_sequence': people_sequence,
+                'frame_count': len(people_sequence)
             }
         return JSONResponse(content=response_payload)
     except Exception as e:
@@ -294,8 +298,8 @@ async def openpose_predict(req: OpenPoseRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # Health check endpoint
-@app.get("/healthz")
-def healthz():
+@app.get("/health")
+def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":

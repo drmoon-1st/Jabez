@@ -55,6 +55,25 @@ def call_openpose_api(image_base64: str, turbo_without_skeleton: bool = False):
         return None
 
 
+def call_openpose_api_batch(images_base64: list, turbo_without_skeleton: bool = False):
+    """Send a batch of base64 images as a sequence to the OpenPose API.
+
+    Returns the parsed JSON response or None on failure.
+    """
+    payload = {
+        "imgs": images_base64,
+        "turbo_without_skeleton": bool(turbo_without_skeleton)
+    }
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=300)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"\n[ERROR] Batch API 호출 실패: {e}")
+        return None
+
+
 def extract_keypoints_from_response(data: dict):
     """API 응답에서 키포인트 목록을 안전하게 추출합니다.
 
@@ -208,7 +227,7 @@ def try_retrieve_result_by_id(pose_id, timeout=5, interval=0.5):
     return None
 
 # ================= 메인 처리 함수 =================
-def process_images_to_2d_csv(image_dir: Path, output_dir: Path, turbo: bool = False):
+def process_images_to_2d_csv(image_dir: Path, output_dir: Path, turbo: bool = False, batch_size: int = 32):
     """이미지 디렉토리의 모든 프레임을 API로 처리하고 2D CSV를 생성합니다."""
     image_files = sorted([f for f in image_dir.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg']])
     if not image_files:
@@ -220,17 +239,64 @@ def process_images_to_2d_csv(image_dir: Path, output_dir: Path, turbo: bool = Fa
     # pending mapping: pose_id -> list of frame indices that reference it
     pending = {}
     
+    batch = []
+    batch_paths = []
+    def flush_batch():
+        nonlocal batch, batch_paths, rows2d, no_detections, pending
+        if not batch:
+            return
+        data = call_openpose_api_batch(batch, turbo_without_skeleton=turbo)
+        # map results to frames
+        if data is None:
+            # mark all frames in batch as NaN
+            for _ in batch_paths:
+                rows2d.append([np.nan] * len(COLS_2D))
+            batch = []
+            batch_paths = []
+            return
+        # expected: data contains 'people_sequence' as list of per-frame people
+        seq = data.get('people_sequence') or []
+        # if server returned single 'people' for each image as list, handle that too
+        if not seq and 'people' in data and isinstance(data['people'], list) and len(data['people']) == len(batch):
+            seq = data['people']
+        # ensure seq length matches batch_paths; if shorter, pad with empty
+        if len(seq) < len(batch_paths):
+            seq += [[]] * (len(batch_paths) - len(seq))
+        for ppl, image_path in zip(seq, batch_paths):
+            try:
+                people = ppl if isinstance(ppl, list) else []
+                if not people:
+                    no_detections += 1
+                    rows2d.append([np.nan] * len(COLS_2D))
+                    continue
+                kps_raw = people[0]
+                kps = np.array(kps_raw).reshape(-1, 3)
+                kps_17 = kps[_IDX_MAP_18_TO_17, :] if kps.shape[0] >= 18 else kps
+                row_2d = []
+                for (x, y, c) in kps_17:
+                    row_2d.extend([float(x), float(y), float(c)])
+                if len(row_2d) < len(COLS_2D):
+                    row_2d.extend([np.nan] * (len(COLS_2D) - len(row_2d)))
+                rows2d.append(row_2d)
+            except Exception as e:
+                print(f"\n[ERROR] 배치 프레임 처리 중 예외: {image_path} {e}")
+                rows2d.append([np.nan] * len(COLS_2D))
+        batch = []
+        batch_paths = []
+
     for image_path in tqdm(image_files, desc="Processing Frames (API Call)", unit="fr"):
         try:
             # 1. Base64 인코딩
             encoded_img = encode_image_to_base64(image_path)
-            
-            # 2. API 호출 (turbo 모드 여부에 따라 키포인트 포함 여부가 달라질 수 있음)
-            data = call_openpose_api(encoded_img, turbo_without_skeleton=turbo)
+            batch.append(encoded_img)
+            batch_paths.append(image_path)
+            data = None
+            if len(batch) >= batch_size:
+                flush_batch()
 
+            # If we didn't flush this image (because batch not full), continue to next
+            # per-frame handling happens in flush_batch
             if data is None:
-                # API 호출 실패 시 해당 프레임은 NaN으로 채움
-                rows2d.append([np.nan] * len(COLS_2D))
                 continue
             # Save raw responses for debugging when output_dir is known
             try:
@@ -293,6 +359,9 @@ def process_images_to_2d_csv(image_dir: Path, output_dir: Path, turbo: bool = Fa
             print(f"\n[ERROR] 프레임 {image_path.name} 처리 중 예외 발생: {e}")
             rows2d.append([np.nan] * len(COLS_2D)) # 오류 시에도 NaN 추가하여 행렬 유지
             
+    # flush any remaining batch
+    flush_batch()
+
     # 3. CSV로 저장
     # If there are pending job ids and polling is enabled, try to retrieve them in batch
     # Guard against undefined globals and infinite loops by enforcing attempt limits.
@@ -355,6 +424,7 @@ def main():
     parser.add_argument("--turbo", action="store_true", help="요청을 turbo_without_skeleton 모드로 보냄(속도 우선, 일부 래퍼는 키포인트 비포함)")
     parser.add_argument("--poll", action="store_true", help="pose_id와 같은 식별자만 반환하는 비동기 래퍼에 대해 결과를 폴링 시도합니다")
     parser.add_argument("--poll-timeout", type=float, default=5.0, help="폴링 시 최대 대기 시간(초) 기본=5.0")
+    parser.add_argument("--batch-size", type=int, default=32, help="프레임을 묶어 한 번에 전송할 배치 크기 (기본:32)")
 
     args = parser.parse_args()
 
@@ -371,7 +441,7 @@ def main():
     POLL_ENABLED = bool(args.poll)
     POLL_TIMEOUT = float(args.poll_timeout)
 
-    process_images_to_2d_csv(image_dir, output_dir, turbo=args.turbo)
+    process_images_to_2d_csv(image_dir, output_dir, turbo=args.turbo, batch_size=int(args.batch_size))
 
 if __name__ == "__main__":
     main()
