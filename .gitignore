@@ -43,3 +43,5 @@ golf/3Dcam/docker/docker-openpose/color/
 
 golf/containers/client/openpose-client/result/
 golf/containers/client/openpose-client/color/
+
+golf/containers/openpose-api/pose_iter_440000.caffemodel

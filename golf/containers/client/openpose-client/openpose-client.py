@@ -13,6 +13,7 @@ import requests
 # ================= 사용자 환경 설정 =================
 # OpenPose API 엔드포인트. WSL 환경에서 Docker 컨테이너가 19030 포트로 실행 중임을 가정.
 API_URL = "http://localhost:19030/openpose_predict"
+# API_URL = "https://yr2ri9z99g1twr-19030.proxy.runpod.net/openpose_predict"
 
 # COCO17 타깃 컬럼 순서 (2D 키포인트만)
 KP_17 = [
@@ -63,6 +64,20 @@ def extract_keypoints_from_response(data: dict):
     """
     if not isinstance(data, dict):
         return None
+
+    # Backward compatibility: server may return an interpolated sequence under 'people_sequence'.
+    # In that case, return the first frame's people so existing per-frame logic continues to work.
+    if 'people_sequence' in data and isinstance(data['people_sequence'], list):
+        seq = data['people_sequence']
+        if not seq:
+            return None
+        first = seq[0]
+        # If first is a list of joints (single person), wrap as [first]
+        if isinstance(first, list) and (len(first) == 0 or isinstance(first[0], list)):
+            return [first]
+        # If first is already a list of people (each a list), return it
+        if isinstance(first, list):
+            return first
 
     # 공통적으로 사용되는 키들
     # 1) 'people' (OpenPose Python API, 여러 프로젝트에서 사용)
