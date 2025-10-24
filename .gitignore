@@ -33,11 +33,11 @@ golf/3Dcam/output
 golf/GOLF_pipeline/.venv/
 golf/GOLF_pipeline/summary
 
-golf/3Dcam/S3_connect/.venv/
-golf/3Dcam/S3_connect/dist/
-golf/3Dcam/S3_connect/build/
-golf/3Dcam/S3_connect/output/
-golf/3Dcam/S3_connect/realsense_pack_and_upload.config.json
+golf/3Dcam/realsense_pack_and_upload/.venv/
+golf/3Dcam/realsense_pack_and_upload/dist/
+golf/3Dcam/realsense_pack_and_upload/build/
+golf/3Dcam/realsense_pack_and_upload/output/
+golf/3Dcam/realsense_pack_and_upload/realsense_pack_and_upload.config.json
 golf/3Dcam/realsense_py/output/
 golf/3Dcam/docker/docker-openpose/color/
 

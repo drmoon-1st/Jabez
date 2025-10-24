@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cognito Google OAuth 테스트</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; text-align: center; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ccc; border-radius: 8px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        #log-area { margin-top: 20px; text-align: left; background: #f4f4f4; padding: 15px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
+        .warning { color: red; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>AWS Cognito Google OAuth 테스트</h2>
+    <p>아래 버튼을 클릭하여 Cognito Hosted UI로 이동합니다.</p>
+    
+    <button id="loginButton">Google 로그인 시작</button>
+    
+    <div class="warning">
+        <p><strong>🚨 주의:</strong> 코드가 정상적으로 돌아가려면 Cognito 앱 클라이언트 설정에 등록된 **콜백 URL**과 이 페이지의 주소가 일치해야 합니다.</p>
+        <p id="currentUrl"></p>
+        <p>로그인 후, 이 페이지로 돌아오면 아래 로그 영역에 URL 파라미터가 표시되어야 합니다.</p>
+    </div>
+
+    <h3>로그 영역</h3>
+    <div id="log-area">인증 코드 (code) 수신 대기 중...</div>
+</div>
+
+<script>
+    // ----------------------------------------------------------------
+    // 💡 1. 여기에 Cognito 및 앱 클라이언트 정보를 입력하세요 
+    // ----------------------------------------------------------------
+    const COGNITO_DOMAIN = "https://ap-northeast-2ogyeziy8w.auth.ap-northeast-2.amazoncognito.com"; // 예: https://your-domain.auth.region.amazoncognito.com
+    const CLIENT_ID = "159l7p0a7ell5c7srlf3v4tqgf"; // Cognito 앱 클라이언트 ID>"; 
+    const REDIRECT_URI = "http://localhost:29000/test_cognito_google_oauth.html"; // 실제 테스트할 이 HTML 파일의 주소여야 합니다!
+    const SCOPE = "openid email profile";
+    const RESPONSE_TYPE = "code"; // OAuth Authorization Code Grant 방식
+    
+    // ----------------------------------------------------------------
+    // 💡 2. 로직 구현 
+    // ----------------------------------------------------------------
+    
+    // 현재 URL 표시 및 콜백 파라미터 확인
+    const currentUrlDisplay = document.getElementById('currentUrl');
+    currentUrlDisplay.textContent = `현재 URL (등록된 콜백 URL과 일치해야 함): ${window.location.href}`;
+
+    function log(message) {
+        document.getElementById('log-area').innerHTML = message;
+    }
+
+    // A. 로그인 버튼 클릭 핸들러: Hosted UI로 리다이렉션
+    document.getElementById('loginButton').addEventListener('click', () => {
+        // CSRF 방지를 위한 state 값 생성 (선택 사항이지만 권장됨)
+        const state = Math.random().toString(36).substring(2, 15);
+        localStorage.setItem('oauth_state', state);
+
+        const authUrl = 
+            `${COGNITO_DOMAIN}/oauth2/authorize?` +
+            `response_type=${RESPONSE_TYPE}&` +
+            `client_id=${CLIENT_ID}&` +
+            `redirect_uri=${REDIRECT_URI}&` +
+            `scope=${SCOPE}&` +
+            `state=${state}`;
+            
+        window.location.href = authUrl;
+    });
+
+    // B. 페이지 로드 시, 콜백 URL에서 'code' 파라미터 확인
+    function checkCallback() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const authCode = urlParams.get('code');
+        const error = urlParams.get('error');
+        const returnedState = urlParams.get('state');
+        const originalState = localStorage.getItem('oauth_state');
+
+        if (error) {
+            log(`❌ 인증 실패 오류: ${error}`);
+            return;
+        }
+
+        if (authCode) {
+            // State 값 검증 (CSRF 방지)
+            if (returnedState !== originalState) {
+                log(`🚨 상태 검증 실패! CSRF 공격 가능성. 반환된 State: ${returnedState}`);
+                localStorage.removeItem('oauth_state');
+                return;
+            }
+            localStorage.removeItem('oauth_state');
+
+            // 성공적으로 인증 코드를 받음
+            log(`✅ Google OAuth 인증 성공! \n\n**다음 단계: 이 인증 코드(code)를 백엔드에 전달하여 Access Token을 교환해야 합니다.**\n\n수신된 인증 코드 (Code):\n${authCode}\n\n전체 URL 파라미터:\n${window.location.search}`);
+        } else if (window.location.search) {
+            // 기타 다른 파라미터가 있을 경우
+            log(`ℹ️ URL에 파라미터가 있지만 'code'가 없습니다. (예상치 못한 응답)`);
+        }
+    }
+
+    checkCallback();
+
+</script>
+
+</body>
+</html>
