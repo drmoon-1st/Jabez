@@ -3,6 +3,9 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  --muted-background: #f4f4f4; /* used for panels, pre blocks */
+  --button-bg: #2563eb; /* blue */
+  --button-foreground: #ffffff;
 }
 
 @theme inline {
@@ -16,6 +19,9 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+    --muted-background: #1f2937;
+    --button-bg: #2563eb;
+    --button-foreground: #ffffff;
   }
 }
 
@@ -23,4 +29,21 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Small utility to style primary buttons consistently */
+.btn-primary {
+  background: var(--button-bg);
+  color: var(--button-foreground);
+  border: none;
+  border-radius: 6px;
+  padding: 10px 20px;
+  cursor: pointer;
+}
+
+.card-muted {
+  background: var(--muted-background);
+  color: var(--foreground);
+  padding: 12px;
+  border-radius: 6px;
 }

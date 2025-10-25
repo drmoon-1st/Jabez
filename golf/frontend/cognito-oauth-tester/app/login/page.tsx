@@ -37,11 +37,12 @@ export default function LoginPage() {
   };
 
   return (
-    <div style={{ padding: 50, textAlign: 'center' }}>
+    <div style={{ padding: 50, textAlign: 'center', color: 'var(--foreground)' }}>
       <h1>Cognito 로그인 테스트</h1>
-      <button 
+      <button
         onClick={handleLogin}
-        style={{ padding: '10px 20px', fontSize: '16px', cursor: 'pointer', marginTop: '20px' }}
+        className="btn-primary"
+        style={{ fontSize: '16px', marginTop: '20px' }}
       >
         Google 로그인 시작 (Hosted UI로 이동)
       </button>
