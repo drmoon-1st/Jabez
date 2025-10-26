@@ -69,6 +69,7 @@ async def start_upload(
     # 2) presigned URL 생성
     try:
         presigned_url = s3_client.create_presigned_url(s3_key, payload.file_type, payload.file_size_bytes)
+        print(f"Generated presigned URL: {presigned_url}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 presigned URL 생성 실패: {e}")
 

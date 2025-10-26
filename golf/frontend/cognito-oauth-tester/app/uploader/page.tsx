@@ -75,20 +75,20 @@ export default function UploaderPage() {
 
             setUploadStatus('2/2 단계: S3에 파일 직접 업로드 중...');
 
+            // presignedUrl 얻은 뒤 실제 업로드
             const s3UploadResponse = await fetch(presignedUrl, {
                 method: 'PUT',
                 headers: {
-                    'Content-Type': file.type,
+                    'Content-Type': file.type || 'application/octet-stream'
                 },
-                body: file,
+                body: file
             });
 
-            if (s3UploadResponse.ok) {
-                setUploadStatus(`🎉 업로드 성공! S3 키: ${s3Key}`);
-            } else {
-                throw new Error(`S3 업로드 실패: ${s3UploadResponse.statusText}`);
+            if (!s3UploadResponse.ok) {
+                throw new Error(`S3 업로드 실패: ${s3UploadResponse.status} ${s3UploadResponse.statusText}`);
             }
 
+            setUploadStatus(`🎉 업로드 성공! S3 키: ${s3Key}`);
         } catch (error) {
             console.error('업로드 실패 상세:', error);
             setUploadStatus(`❌ 업로드 실패: ${error instanceof Error ? error.message : String(error)}`);
