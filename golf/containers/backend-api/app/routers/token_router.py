@@ -102,3 +102,18 @@ async def exchange_code_for_token(
             status_code=500,
             detail={"message": f"백엔드 서버 내부 오류 발생: {str(e)}"}
         )
+
+# ----------------------------------------------------
+# 로그아웃 엔드포인트: /token/logout
+# ----------------------------------------------------
+# application의 토큰을 삭제시킴
+@router.post("/logout")
+def logout(response: Response):
+    """
+    HttpOnly 쿠키(id_token, access_token)를 삭제(만료)하여 서버측 세션을 종료합니다.
+    프론트는 credentials: 'include'로 호출하세요.
+    """
+    # SameSite / Secure 등은 배포환경에 맞게 설정되어야 합니다.
+    response.delete_cookie("id_token", path="/")
+    response.delete_cookie("access_token", path="/")
+    return {"status": "logged_out"}

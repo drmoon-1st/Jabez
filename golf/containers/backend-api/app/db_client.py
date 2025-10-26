@@ -70,3 +70,43 @@ class DBClient:
             cursor.execute(sql, params)
         self.conn.commit()
         return upload_id
+    
+    def update_upload_status(self, job_id: str, status: str, s3_result_path: Optional[str] = None) -> None:
+        """
+        job_id 레코드의 processing_status와 s3_result_path를 갱신합니다.
+        """
+        if not DB_TABLE_NAME:
+            raise RuntimeError("DB_TABLE_NAME not configured")
+
+        if s3_result_path is not None:
+            sql = f"""
+                UPDATE {DB_TABLE_NAME}
+                SET processing_status = %s, s3_result_path = %s
+                WHERE id = %s
+            """
+            params = (status, s3_result_path, job_id)
+        else:
+            sql = f"""
+                UPDATE {DB_TABLE_NAME}
+                SET processing_status = %s
+                WHERE id = %s
+            """
+            params = (status, job_id)
+
+        with self.conn.cursor() as cursor:
+            cursor.execute(sql, params)
+        self.conn.commit()
+
+    def get_job_owner(self, job_id: str) -> Optional[str]:
+        """
+        Return the user_id (owner) for a given job_id. Returns None if not found.
+        """
+        if not DB_TABLE_NAME:
+            raise RuntimeError("DB_TABLE_NAME not configured")
+        sql = f"SELECT user_id FROM {DB_TABLE_NAME} WHERE id = %s LIMIT 1"
+        with self.conn.cursor() as cursor:
+            cursor.execute(sql, (job_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return row[0]

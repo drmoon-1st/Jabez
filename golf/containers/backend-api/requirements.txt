@@ -2,7 +2,7 @@
 
 # 웹 프레임워크 및 데이터 모델
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 
 # 환경 및 AWS 통신

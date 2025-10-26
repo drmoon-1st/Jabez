@@ -162,3 +162,21 @@ def get_current_user_id(
     except JWTError as e:
         print(f"JWT 검증 실패: {e} (source={source})")
         return None
+
+
+def get_user_id_from_token(token: Optional[str]) -> Optional[str]:
+    """
+    Helper to validate a raw Bearer token string and return user_id (sub).
+    Reuses existing verification logic.
+    """
+    if not token:
+        return None
+    if token.startswith("Bearer "):
+        token = token.split(" ", 1)[1]
+    try:
+        claims = _verify_signature(token)
+        _validate_claims(claims, audience=CLIENT_ID if CLIENT_ID else None)
+        return claims.get("sub")
+    except JWTError as e:
+        print(f"JWT 검증 실패 (token helper): {e}")
+        return None

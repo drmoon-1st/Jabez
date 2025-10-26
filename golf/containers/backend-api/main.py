@@ -8,8 +8,9 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware # CORS 임포트
-from routers import upload_router 
-from routers import token_router 
+from app.routers import upload_router
+from app.routers import token_router
+from app.routers import result_router
 
 
 
@@ -44,6 +45,9 @@ app.include_router(token_router.router, prefix="/api")
 
 # upload_router.py의 prefix=/upload와 결합 -> 최종 경로: /api/upload
 app.include_router(upload_router.router, prefix="/api") 
+ 
+# result_router.py의 prefix=/result와 결합 -> 최종 경로: /api/result
+app.include_router(result_router.router, prefix="/api") 
 
 @app.get("/")
 def read_root():
