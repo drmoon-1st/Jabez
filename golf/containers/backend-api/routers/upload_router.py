@@ -52,7 +52,9 @@ def create_s3_key(user_id: Optional[str], non_member_id: Optional[str], source: 
     
     # 최종 S3 Key 구조: [소유자 ID]/[업로드 소스]/[UUID].[확장자]
     s3_key = f"{owner_id}/{source.lower()}/{upload_uuid}.{ext}"
-    return s3_key
+    
+    # 💡 수정: S3 Key와 함께 Job ID로 사용할 upload_uuid를 함께 반환
+    return s3_key, upload_uuid # websocket을 위해 프론트도 작업 id를 알아야함
 
 
 @router.post("/")

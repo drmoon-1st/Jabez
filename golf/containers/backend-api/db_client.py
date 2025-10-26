@@ -13,6 +13,7 @@ DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_TABLE_NAME = os.getenv("DB_TABLE_NAME")
 
 class DBClient:
     def __init__(self):
@@ -30,37 +31,39 @@ class DBClient:
 
     def insert_upload_intent(
         self, 
+        job_id: str,    # job id를 외부에서 받아옴, websocket.py에서
         user_id: Optional[str],
         non_member_identifier: Optional[str], 
         upload_source: str,                   
         s3_key: str, 
         filename: str, 
         filetype: str, 
-        file_size_bytes: int,                 
+        file_size_bytes: int,     
+        s3_result_path: Optional[str] = None    # 초기 result는 당연히 None
     ) -> str:
         """업로드 의도 레코드를 DB에 삽입하고, 생성된 UUID를 반환합니다."""
         
-        # FastAPI에서 생성된 UUID를 사용하거나, DB에서 생성하도록 설정할 수 있습니다.
-        upload_id = str(uuid4()) 
-        
-        sql = """
-            INSERT INTO uploads (
+        upload_id = job_id  # 외부에서 받아온 job_id 사용
+
+        sql = f"""
+            INSERT INTO {DB_TABLE_NAME} (
                 id, user_id, non_member_identifier, upload_source, 
                 s3_key, original_filename, file_type, file_size_bytes, 
-                processing_status
+                processing_status, s3_result_path
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING'
+                %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s
             )
         """
         params = (
-            upload_id, 
+            upload_id, # job_id 사용
             user_id, 
             non_member_identifier, 
             upload_source,
             s3_key, 
             filename, 
             filetype, 
-            file_size_bytes
+            file_size_bytes,
+            s3_result_path
         )
 
         with self.conn.cursor() as cursor:
