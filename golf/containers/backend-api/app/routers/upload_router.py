@@ -105,10 +105,10 @@ async def start_upload(
 
         # 3.a) 상태 업데이트: presigned URL 생성 직후, 프론트에 전달 전 S3_PUTING으로 기록
         try:
-            db_client.update_upload_status(job_id=job_id, status='S3_PUTING')
+            db_client.update_upload_status(job_id=job_id, status='PROCESSING')
         except Exception as e:
             # 로그만 남기고 계속 진행 (프로토타입)
-            print(f"[DB Update Warning] Failed to set S3_PUTING for job_id={job_id}: {e}")
+            print(f"[DB Update Warning] Failed to set PROCESSING for job_id={job_id}: {e}")
 
         # 4) presigned URL과 S3 Key 반환
         return {"presigned_url": presigned_url, 

@@ -17,7 +17,9 @@ Or pass secret explicitly:
   python .\lambda-api\send_webhook.py --secret mysecret --job-id myjob --s3-key path/to/result.json
 
 """
-import argparse
+
+from dotenv import load_dotenv
+load_dotenv()  # Load .env if present
 import time
 import hmac
 import hashlib
@@ -31,8 +33,22 @@ except Exception:
     print("Missing dependency: requests. Install with: pip install requests")
     sys.exit(1)
 
-DEFAULT_URL = "http://localhost:29001/api/result/webhook/job/complete"
-DEFAULT_SECRET_ENV = "RUNPOD_WEBHOOK_SECRET"
+# DB access removed for Lambda-friendly static webhook sender
+
+# --- 백엔드 API 주소 ---
+BACKEND_API_BASE_URL = os.getenv("BACKEND_API_BASE_URL")
+# If BACKEND_API_BASE_URL is provided (e.g. http://localhost:29001 or http://host:port/api),
+# append the webhook path without duplicating '/api'. We'll simply append the path
+# '/result/webhook/job/complete' to the base URL.
+BACKEND_API_WEBHOOK_URL = (f"{BACKEND_API_BASE_URL.rstrip('/')}/result/webhook/job/complete" \
+                          if BACKEND_API_BASE_URL else None)
+print(f"[Config] BACKEND_API_WEBHOOK_URL={BACKEND_API_WEBHOOK_URL}")
+
+RUNPOD_WEBHOOK_SECRET = os.getenv("RUNPOD_WEBHOOK_SECRET")
+
+# test용 dumy 값, 실제로는 데이터 흐름에서 자연스럽게 공급되는값, 지금은 백엔드에서 s3로 보낸후, 결과를 기다리는 backend에 전해줄 값 
+S3_KEY = os.getenv("S3_KEY")
+JOB_ID = os.getenv("JOB_ID")
 
 
 def make_signature(secret: str, timestamp: int, body_bytes: bytes) -> str:
@@ -78,28 +94,53 @@ def send_webhook(url: str, secret: str, job_id: str, s3_key: str, extra: dict = 
 
 
 def main():
-    p = argparse.ArgumentParser(description="Send a signed webhook to the backend to simulate RunPod completion")
-    p.add_argument("--url", default=os.getenv("WEBHOOK_URL", DEFAULT_URL), help="Full webhook URL (default: %(default)s)")
-    p.add_argument("--secret", default=os.getenv(DEFAULT_SECRET_ENV), help=f"Webhook secret; or set env {DEFAULT_SECRET_ENV}")
-    p.add_argument("--job-id", required=True, help="Job ID to send")
-    p.add_argument("--s3-key", required=True, help="S3 key/path to the result file")
-    p.add_argument("--extra", help="Extra JSON to merge into payload (e.g. '{\"foo\":123}')")
-    p.add_argument("--no-verbose", dest="verbose", action="store_false", help="Disable verbose output")
-    args = p.parse_args()
-
-    if not args.secret:
-        print(f"Error: no secret provided and env {DEFAULT_SECRET_ENV} not set")
+    # Load configuration from environment variables (static behavior)
+    # Enforce: always derive webhook URL from BACKEND_API_BASE_URL
+    if not BACKEND_API_BASE_URL:
+        print("Error: BACKEND_API_BASE_URL environment variable must be set")
         sys.exit(2)
+    url = BACKEND_API_WEBHOOK_URL
+    # prefer RUNPOD_WEBHOOK_SECRET loaded at module import
+    secret = RUNPOD_WEBHOOK_SECRET
 
+    # JOB_ID and S3_KEY are expected to be provided via environment for static runs.
+    # If JOB_ID is missing, generate a timestamped test id.
+    job_id = JOB_ID
+    s3_key = S3_KEY
+
+    # Optional: extra JSON string in env (EXTRA_JSON) will be parsed and merged.
     extra = None
-    if args.extra:
+    extra_raw = os.getenv("EXTRA_JSON")
+    if extra_raw:
         try:
-            extra = json.loads(args.extra)
+            extra = json.loads(extra_raw)
         except Exception as e:
-            print(f"Failed to parse --extra JSON: {e}")
+            print(f"Failed to parse EXTRA_JSON env: {e}")
             sys.exit(2)
 
-    send_webhook(args.url, args.secret, args.job_id, args.s3_key, extra=extra, verbose=args.verbose)
+    # Verbose control: set VERBOSE=0 or VERBOSE=false to disable
+    verbose_env = os.getenv("VERBOSE", "1")
+    verbose = False if verbose_env.lower() in ("0", "false", "no") else True
+
+    # Validate required values
+    if not secret:
+        print("Error: no RUNPOD_WEBHOOK_SECRET provided in environment")
+        sys.exit(2)
+    if not url:
+        print("Error: no WEBHOOK_URL configured")
+        sys.exit(2)
+    if not s3_key:
+        print("Error: no S3_KEY / S3_RESULT_PATH provided in environment")
+        sys.exit(2)
+
+    if verbose:
+        print("Configuration:")
+        print(f"  WEBHOOK_URL={url}")
+        print(f"  JOB_ID={job_id}")
+        print(f"  S3_KEY={s3_key}")
+        print(f"  EXTRA_JSON={extra}")
+
+    send_webhook(url, secret, job_id, s3_key, extra=extra, verbose=verbose)
 
 
 if __name__ == "__main__":

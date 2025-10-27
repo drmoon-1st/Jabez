@@ -5,6 +5,8 @@
 import os
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
+from typing import Optional
 
 S3_VIDEO_BUCKET_NAME = os.getenv("S3_VIDEO_BUCKET_NAME")
 S3_RESULT_BUCKET_NAME = os.getenv("S3_RESULT_BUCKET_NAME")
@@ -13,11 +15,17 @@ PRESIGNED_URL_EXPIRATION = 3600  # 1 hour
 
 class S3Client:
     def __init__(self):
+        # Use signature v4 and virtual-host addressing to avoid redirect/host mismatch
+        config = Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"}
+        )
         self._client = boto3.client(
             "s3",
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            region_name=AWS_REGION
+            region_name=AWS_REGION,
+            config=config,
         )
 
     def create_presigned_url(self, object_key: str, file_type: str, file_size: int) -> str:
@@ -42,21 +50,25 @@ class S3Client:
         )
         return url
     
-    def create_presigned_get_url(self, key: str, bucket_name: str = None, expires_in: int = 3600) -> str:
+    def create_presigned_get_url(self, object_key: str, bucket_name: Optional[str] = None, expires_in: int = PRESIGNED_URL_EXPIRATION) -> str:
         """
-        결과 S3 버킷에 저장된 객체(key)에 대한 presigned GET URL 생성.
-        기본 버킷은 S3_RESULT_BUCKET_NAME.
+        Generate a presigned GET URL using the configured boto3 client.
+
+        Accepts the object key as the primary argument. If `bucket_name` is not
+        provided, `S3_RESULT_BUCKET_NAME` will be used. This matches existing
+        caller usage which passes only the s3 key.
         """
-        target_bucket = bucket_name or S3_RESULT_BUCKET_NAME
-        if not target_bucket:
-            raise RuntimeError("S3_RESULT_BUCKET_NAME not configured")
+        bucket = bucket_name or S3_RESULT_BUCKET_NAME
+        if not bucket:
+            raise RuntimeError("S3 result bucket is not configured (S3_RESULT_BUCKET_NAME)")
 
         try:
             url = self._client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': target_bucket, 'Key': key},
-                ExpiresIn=expires_in
+                ClientMethod="get_object",
+                Params={"Bucket": bucket, "Key": object_key},
+                ExpiresIn=expires_in,
             )
             return url
         except ClientError as e:
+            # Raise a RuntimeError so callers return 500 with a helpful message
             raise RuntimeError(f"Failed to create presigned GET URL: {e}")

@@ -23,23 +23,6 @@ db_client = DBClient()
 # ----------------------------------------------------
 # 1. WebSocket 연결 엔드포인트: /result/ws/analysis/{job_id}
 # ----------------------------------------------------
-# 지금은 안씀, 혹시나 싶어서 남겨둠
-@router.websocket("/ws/analysis/{job_id}")
-async def websocket_endpoint(websocket: WebSocket, job_id: str):
-    # 기존 경로: job_id를 경로에서 받아 즉시 등록하는 경우
-    await websocket.accept()
-    await manager.connect(job_id, websocket)
-
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(job_id)
-        print(f"[WS] {job_id} 연결 해제됨.")
-    except Exception as e:
-        manager.disconnect(job_id)
-        print(f"[WS] {job_id} 처리 중 오류: {e}")
-
 
 @router.websocket("/ws/analysis")
 async def websocket_preconnect(websocket: WebSocket):
@@ -104,7 +87,7 @@ async def websocket_preconnect(websocket: WebSocket):
 
             # 5) 토큰 검증: raw token -> user_id 추출
             #    (auth_utils.get_user_id_from_token는 JWT 서명/claims를 검증하여 sub(user id)를 반환)
-            from auth_utils import get_user_id_from_token
+            from app.auth_utils import get_user_id_from_token
             user_id = get_user_id_from_token(token) if token else None
 
             # 6) DB에서 job의 소유자(owner)를 조회
@@ -171,9 +154,9 @@ async def handle_webhook(request: Request):
     if not job_id or not s3_key:
         raise HTTPException(status_code=400, detail="job_id and s3_result_path required")
 
-    # 2) DB 업데이트: PROCESSING_DONE (RunPod 완료)
+    # 2) DB 업데이트: COMPLETED (RunPod 완료)
     try:
-        db_client.update_upload_status(job_id=job_id, status="PROCESSING_DONE", s3_result_path=s3_key)
+        db_client.update_upload_status(job_id=job_id, status="COMPLETED", s3_result_path=s3_key)
     except Exception as e:
         print(f"[DB Update Error] job_id={job_id} error={e}")
 
@@ -191,6 +174,11 @@ async def handle_webhook(request: Request):
         print(f"[DB Update Warning] Failed to set GETTING for job_id={job_id}: {e}")
 
     try:
+        # Debug: list active connections before attempting push
+        try:
+            print(f"[DEBUG] active_connections before push: {list(manager.active_connections.keys())}")
+        except Exception:
+            print("[DEBUG] could not read manager.active_connections")
         pushed = await manager.send_result_to_client(job_id, presigned_url)
     except Exception as e:
         print(f"[WS Push Exception] job_id={job_id} error={e}")
