@@ -1,13 +1,19 @@
 # 입력(캡처 산출물)
-img_dir: "/Users/ihyeonjun/Documents/golf_anal/output/color"
-csv_path: "/Users/ihyeonjun/Documents/golf_anal/output/skeleton3d_only_normalized_xyz.csv"
+img_dir: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/color"
+
+# CSV 경로 분리: 2D 오버레이 vs 3D 메트릭스
+overlay_csv_path: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/result/skeleton2d (2).csv"
+metrics_csv_path: "/Users/ihyeonjun/Documents/output/swing_20251002_145443/skeleton3d_interp.csv"
+
+# (호환용) 단일 CSV를 사용하는 기존 파이프라인을 위한 fallback 경로
+# csv_path: "/Users/ihyeonjun/Documents/golf_anal/output/skeleton2d3d.csv"
 
 # 메트릭 결과
-metrics_csv: "/Users/ihyeonjun/Documents/golf_anal/summary/metrics.csv"
+metrics_csv: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/metrics.csv"
 
 # 오버레이 영상 (선택)
 make_overlay: true
-overlay_mp4: "/Users/ihyeonjun/Documents/golf_anal/summary/output.mp4"
+overlay_mp4: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/overlay.mp4"
 fps: 30
 codec: "mp4v"
 
@@ -22,6 +28,23 @@ draw:
     font_scale: 0.4
     thickness: 1
     color_bgr: [0,255,0]    # 초록색 글자
+  smoothing: # 스무딩을 위한 설정
+    enabled: false               # 2D 좌표 스무딩 활성화
+    # 사용 가능: ema | moving | median | gaussian | hampel_ema | oneeuro
+    method: oneeuro       # 기본: Hampel로 이상치 제거 후 EMA 적용
+    window: 7                   # moving/median/hampel에 사용 (권장 홀수)
+    alpha: 0.25                 # ema/hampel_ema에 사용 (0<alpha<1)
+    # gaussian 전용
+    gaussian_sigma: 2.0         # 생략 시 window/3 자동
+    # hampel 전용
+    hampel_sigma: 3.0           # 중앙값 기준 n·MAD 초과 시 이상치로 간주
+    # oneeuro 전용 (프레임레이트 필요: 상위 fps 키 사용)
+    oneeuro_min_cutoff: 1.2
+    oneeuro_beta: 0.020
+    oneeuro_d_cutoff: 1.0
+    # 이하 옵션은 더 이상 사용하지 않습니다 (점프 제한 제거)
+    # robust_outlier: false
+    # max_jump_px: 0
 
 landmarks:
   head: "Nose"           # CSV가 Nose__x / Nose__y / Nose__z 라면 이렇게
@@ -31,3 +54,14 @@ landmarks:
   hip_right: "RHip"
   wrist_left: "LWrist"
   wrist_right: "RWrist"
+
+# CSV → JSON 내보내기 설정 (csv_to_json.py에서 사용)
+json_export:
+  input: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test"   # CSV들이 있는 폴더 또는 단일 CSV 파일 경로
+  output_dir: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test"  # 생략 시 input과 동일 폴더 사용
+  pattern: "*.csv"                 # 폴더 입력 시 대상 CSV 패턴
+  orient: "records"               # records|split|index|columns|values|table
+  indent: 2                        # records 모드 들여쓰기
+  ensure_ascii: false              # true면 한글 ASCII 이스케이프
+  merge_output: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/all_metrics.json"  # 모든 CSV를 하나의 JSON으로 병합 저장
+  merge_mode: "by-file"           # by-file: {"csv_stem": [records...]}, concat: [{source, ...}]

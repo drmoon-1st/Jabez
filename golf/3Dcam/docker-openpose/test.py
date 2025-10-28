@@ -12,7 +12,7 @@ import requests
 
 # ================= 사용자 환경 설정 =================
 # OpenPose API 엔드포인트. WSL 환경에서 Docker 컨테이너가 19030 포트로 실행 중임을 가정.
-API_URL = "http://localhost:19030/openpose_predict" 
+API_URL = "https://ronald-hemagglutinative-histogenetically.ngrok-free.dev/openpose_predict" 
 
 # COCO17 타깃 컬럼 순서 (2D 키포인트만)
 KP_17 = [
