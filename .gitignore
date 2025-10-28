@@ -42,5 +42,12 @@ golf/3Dcam/realsense_py/output/
 golf/3Dcam/docker-openpose/color/
 golf/3Dcam/docker-openpose/result/raw_responses/
 
+golf/containers/client/openpose-client/result
+golf/containers/client/openpose-client/color
+
+golf/3Dcam/realsense_pack_and_upload/dist
+
+golf/containers/openpose-api/pose_iter_440000.caffemodel
+
 golf/GOLF_pipeline/output
 golf/GOLF_pipeline/input
