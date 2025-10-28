@@ -1,0 +1,1 @@
+mmaction-clinet는 skeleton2d.csv를 읽어서 sever로 보내는 코드

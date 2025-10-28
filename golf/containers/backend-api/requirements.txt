@@ -1,0 +1,16 @@
+# backend-api/requirements.txt
+
+# 웹 프레임워크 및 데이터 모델
+fastapi
+uvicorn[standard]
+pydantic
+
+# 환경 및 AWS 통신
+python-dotenv
+boto3
+
+# Cognito JWT 토큰 검증
+python-jose
+
+# MariaDB/MySQL 데이터베이스 연결
+mysql-connector-python

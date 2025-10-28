@@ -1,0 +1,40 @@
+# ----------------------------------------
+# MMACTION Base Image (한 번만 빌드)
+# ----------------------------------------
+ARG PYTORCH="1.8.1"
+ARG CUDA="10.2"
+ARG CUDNN="7"
+
+FROM pytorch/pytorch:${PYTORCH}-cuda${CUDA}-cudnn${CUDNN}-devel
+
+ENV TORCH_CUDA_ARCH_LIST="6.0 6.1 7.0+PTX"
+ENV TORCH_NVCC_FLAGS="-Xfatbin -compress-all"
+
+# NVIDIA 키 등록 (오류 방지)
+RUN apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/3bf863cc.pub && \
+    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu1804/x86_64/7fa2af80.pub
+
+# 시스템 패키지 설치
+RUN apt-get update && apt-get install -y \
+    git ninja-build build-essential cmake libglib2.0-0 libsm6 libxrender-dev libxext6 \
+    libjpeg-dev libpng-dev zlib1g-dev python3-dev ffmpeg \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Python 기반 구성
+RUN python -m pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir openmim==0.3.9
+RUN pip install cython==3.0.11 --no-cache-dir
+# Copy mmaction2 requirements into the base image and install core python deps
+# This keeps mmaction core dependencies in the base layer (they change rarely)
+COPY ./mmaction2/requirements /tmp/mmaction2-requirements
+
+# Install the build-time python requirements (if present)
+RUN if [ -f /tmp/mmaction2-requirements/build.txt ]; then \
+            pip install --no-cache-dir -r /tmp/mmaction2-requirements/build.txt; \
+        fi
+
+# Install mmengine/mmcv lines listed in mminstall.txt (if present) via mim
+# mminstall.txt usually contains mmengine/mmcv version constraints
+RUN if [ -f /tmp/mmaction2-requirements/mminstall.txt ]; then \
+            xargs -a /tmp/mmaction2-requirements/mminstall.txt mim install; \
+        fi

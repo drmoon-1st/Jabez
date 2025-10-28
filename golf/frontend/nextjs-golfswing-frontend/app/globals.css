@@ -1,0 +1,140 @@
+@import "tailwindcss";
+
+/* -------------------------------------------------------------------------- */
+/* 1. CSS 변수 정의 (컬러 팔레트)                                             */
+/* -------------------------------------------------------------------------- */
+
+/* 라이트 모드 기본 설정 */
+:root {
+  --background: #ffffff; /* 주 배경 (body) */
+  --foreground: #171717; /* 주 전경 (텍스트) */
+  --muted-background: #f4f4f4; /* 흐린 배경 (카드, pre 블록) */
+  --border: #e5e5e5; /* 밝은 테두리 색상 */
+  
+  --button-bg: #2563eb; /* 버튼 배경 (파랑) */
+  --button-foreground: #ffffff; /* 버튼 텍스트 (흰색) */
+}
+
+/* @theme inline 설정 (Tailwind CSS나 기타 프레임워크에서 사용될 수 있음) */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* 다크 모드 설정 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a; /* 어두운 검은색 배경 */
+    --foreground: #ededed; /* 밝은 회색 텍스트 */
+    --muted-background: #1f2937; /* 약간 더 진한 회색 (패널, 카드 등) */
+    --border: #3f3f46; /* 어두운 테두리 색상 */
+    
+    /* 버튼 색상은 일관성을 위해 유지 */
+    --button-bg: #2563eb;
+    --button-foreground: #ffffff;
+  }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* 2. 전역 및 기본 요소 스타일                                               */
+/* -------------------------------------------------------------------------- */
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+  /* 가독성을 위해 Antialiasing 적용 */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+hr {
+  /* 인라인 스타일에서 참조할 수 있도록 조정 */
+  border-color: var(--border);
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* 3. 유틸리티 및 컴포넌트 클래스                                           */
+/* -------------------------------------------------------------------------- */
+
+/* Primary Button Style (.btn-primary) */
+.btn-primary {
+  background: var(--button-bg);
+  color: var(--button-foreground);
+  border: none;
+  border-radius: 6px;
+  padding: 10px 20px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  transition: background 0.2s, opacity 0.2s;
+  font-size: 16px; /* 버튼 폰트 크기 통일 */
+}
+
+/* Primary Button Hover */
+.btn-primary:hover {
+  background: #1d4ed8; /* 더 진한 파란색 */
+}
+
+/* Primary Button Disabled (가독성 문제 해결) */
+.btn-primary:disabled {
+  cursor: not-allowed !important;
+  background: var(--border); /* 흐린 배경색 */
+  color: #a1a1a1; /* 흐린 텍스트색 */
+  opacity: 1; 
+  box-shadow: none;
+}
+
+
+/* Muted Card Style (.card-muted) */
+.card-muted {
+  background: var(--muted-background);
+  color: var(--foreground);
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border); 
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08); 
+}
+
+/* Card Container (UI 코드의 메인 div 스타일) */
+.card-container {
+    padding: 50px; 
+    max-width: 600px; 
+    margin: auto; 
+    border: 1px solid var(--border); 
+    border-radius: 8px;
+    background: var(--background);
+    /* 드래그 앤 드롭 영역 구분을 위해 그림자 추가 */
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+}
+
+/* Log Output (pre 태그) 스타일 (.log-output) */
+.log-output {
+    margin-top: 20px;
+    padding: 10px;
+    background-color: var(--muted-background); 
+    color: var(--foreground);
+    white-space: pre-wrap;
+    border-radius: 4px;
+    border: 1px solid var(--border); /* 명확한 구분을 위해 테두리 추가 */
+    font-family: monospace;
+    overflow-x: auto;
+}
+
+/* 로그아웃 버튼 스타일 (.logout-button) */
+.logout-button {
+    border: none; 
+    background: transparent; 
+    color: var(--foreground); 
+    opacity: 0.7; 
+    cursor: pointer;
+    transition: opacity 0.2s;
+    padding: 0; /* 인라인 버튼처럼 보이도록 패딩 제거 */
+}
+
+.logout-button:hover {
+    opacity: 1;
+}
