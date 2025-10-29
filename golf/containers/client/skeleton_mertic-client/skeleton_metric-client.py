@@ -57,6 +57,29 @@ def call_openpose_api_for_video(video_b64: str, s3_key: str = None, mime_type: s
         return None
 
 
+def call_openpose_api_for_s3key(s3_key: str, mime_type: str = None, turbo_without_skeleton: bool = False):
+    """Call the server API by providing an S3 key only (no base64 payload).
+
+    The server is expected to download inputs from S3 itself and process them.
+    """
+    payload = {
+        "turbo_without_skeleton": bool(turbo_without_skeleton),
+    }
+    if s3_key:
+        payload["s3_key"] = s3_key
+    if mime_type:
+        payload["mime_type"] = mime_type
+
+    headers = {'Content-Type': 'application/json'}
+    try:
+        response = requests.post(API_URL, headers=headers, data=json.dumps(payload), timeout=180)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"\n[ERROR] API 호출 실패: {e}")
+        return None
+
+
 def extract_keypoints_from_response(data: dict):
     """API 응답에서 키포인트 목록을 안전하게 추출합니다.
 
@@ -196,108 +219,75 @@ def try_retrieve_result_by_id(pose_id, timeout=5, interval=0.5):
     return None
 
 # ================= 메인 처리 함수 =================
-def process_video_to_2d_csv_from_s3key(s3_key: str, input_root: Path, output_dir: Path, turbo: bool = False):
-    """S3 키(경로)를 이용해 input_root/s3_key의 mp4 파일을 읽어 API로 전송하고
-    반환된 people_sequence를 skeleton2d.csv로 저장합니다.
+def send_request_for_s3key(s3_key: str, dimension: str, api_url: str = None, turbo: bool = False):
+    """Send a lightweight request to the server that points it at an S3 key.
+
+    This client no longer uploads video data — the server downloads from S3 and writes
+    results back to S3. The client only validates the s3_key and requests processing.
     """
-    file_path = input_root / s3_key
-    if not file_path.exists():
-        print(f"[FATAL] 입력 비디오 파일을 찾을 수 없습니다: {file_path}")
-        return
+    # validate s3_key basic structure: expect at least two segments and the dimension as second
+    if not s3_key or '/' not in s3_key:
+        print(f"[ERROR] s3_key 형식이 잘못되었습니다. 기대형식: <user_id>/<dimension>/<...>. 받은 값: {s3_key}")
+        return None
 
-    print(f"[INFO] Sending video {file_path} -> API {API_URL}")
-    video_b64 = encode_file_to_base64(file_path)
-    data = call_openpose_api_for_video(video_b64, s3_key=s3_key, mime_type="video/mp4", turbo_without_skeleton=turbo)
-    if data is None:
-        print("[ERROR] API가 응답하지 않거나 실패했습니다.")
-        return
+    parts = s3_key.strip('/').split('/')
+    if len(parts) < 2:
+        print(f"[ERROR] s3_key에 dimension 세그먼트가 없습니다: {s3_key}")
+        return None
 
-    # Save raw response for debugging
-    try:
-        raw_dir = output_dir / "raw_responses"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        raw_file = raw_dir / (file_path.stem + ".json")
-        with open(raw_file, 'w', encoding='utf-8') as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    key_dimension = parts[1]
+    if key_dimension.lower() != dimension.lower():
+        print(f"[ERROR] s3_key의 dimension({key_dimension})이 요청한 dimension({dimension})과 일치하지 않습니다.")
+        return None
 
-    # API는 people_sequence와 frame_count를 반환하도록 설계됨
-    people_sequence = data.get('people_sequence', None)
-    frame_count = data.get('frame_count', None)
+    # optional: check file extension matches dimension expectations
+    fname = parts[-1]
+    if dimension.lower() == '2d' and not fname.lower().endswith('.mp4'):
+        print(f"[WARN] 2d 처리 예상 MP4 파일이 아닙니다: {fname}")
+    if dimension.lower() == '3d' and not (fname.lower().endswith('.zip') or fname.lower().endswith('.tar') or fname.lower().endswith('.tar.gz')):
+        print(f"[WARN] 3d 처리 예상 ZIP/TAR 파일이 아닙니다: {fname}")
 
-    # Fallback: if people_sequence absent but 'people' exists, try that
-    if people_sequence is None and 'people' in data:
-        people_sequence = data['people']
+    # decide mime_type
+    mime_type = 'video/mp4' if dimension.lower() == '2d' else 'application/zip'
 
-    if people_sequence is None and frame_count is None:
-        print(f"[ERROR] API 응답에 people_sequence 또는 frame_count가 없습니다. 응답 키: {list(data.keys())}")
-        return
+    # call server (no base64 payload)
+    prev_api = globals().get('API_URL')
+    if api_url:
+        globals()['API_URL'] = api_url
+    print(f"[INFO] 요청 전송: s3_key={s3_key}, dimension={dimension}, api={globals().get('API_URL')}")
+    resp = call_openpose_api_for_s3key(s3_key, mime_type=mime_type, turbo_without_skeleton=turbo)
 
-    # If frame_count provided but people_sequence shorter, pad with empties
-    if frame_count is None:
-        frame_count = len(people_sequence)
+    # restore API_URL if we temporarily set it
+    if api_url:
+        globals()['API_URL'] = prev_api
 
-    rows2d = []
-    for i in range(int(frame_count)):
-        frame_people = []
-        if people_sequence and i < len(people_sequence):
-            frame_people = people_sequence[i]
+    if resp is None:
+        print("[ERROR] 서버가 응답하지 않았습니다.")
+        return None
 
-        if not frame_people:
-            rows2d.append([np.nan] * len(COLS_2D))
-            continue
-
-        # use first person if list of people
-        person = frame_people[0] if isinstance(frame_people, list) and len(frame_people) > 0 else frame_people
-
-        # person may be flat list [x,y,c,...] or list of [x,y,c] lists
-        try:
-            p_arr = np.array(person)
-            if p_arr.ndim == 1 and p_arr.size % 3 == 0:
-                kps = p_arr.reshape(-1, 3)
-            elif p_arr.ndim == 2 and p_arr.shape[1] == 3:
-                kps = p_arr
-            else:
-                # unexpected shape
-                rows2d.append([np.nan] * len(COLS_2D))
-                continue
-        except Exception:
-            rows2d.append([np.nan] * len(COLS_2D))
-            continue
-
-        # reorder 18->17 if present
-        kps_17 = kps[_IDX_MAP_18_TO_17, :] if kps.shape[0] >= 18 else kps
-        row_2d = []
-        for (x, y, c) in kps_17:
-            row_2d.extend([float(x), float(y), float(c)])
-        if len(row_2d) < len(COLS_2D):
-            row_2d.extend([np.nan] * (len(COLS_2D) - len(row_2d)))
-        rows2d.append(row_2d)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out2d = output_dir / "skeleton2d.csv"
-    pd.DataFrame(rows2d, columns=COLS_2D).to_csv(out2d, index=False)
-    print(f"\n[SAVE] 최종 2D CSV 저장 완료: {out2d} (frames={len(rows2d)})")
+    # The server uploads results to S3; the client only prints server reply (job id / status)
+    print(f"[INFO] 서버 응답: {json.dumps(resp, ensure_ascii=False)}")
+    return resp
 
 
 # ================= CLI =================
 def main():
     global API_URL
-    parser = argparse.ArgumentParser(description="S3 key로 지정된 MP4 파일을 API로 전송하여 skeleton2d.csv 생성")
-    parser.add_argument("--s3-key", type=str, required=True, help="S3 객체 키 예: <job_id>/web_2d/filename.mp4")
-    parser.add_argument("--input-root", type=str, default="input", help="로컬에서 S3 키가 위치한 루트 폴더 (기본: input)")
-    parser.add_argument("--output", type=str, default="output", help="CSV가 저장될 출력 폴더 (기본: output)")
+    parser = argparse.ArgumentParser(description="S3에 업로드된 입력을 서버가 직접 처리하도록 s3_key를 전달합니다.")
+    parser.add_argument("--s3-key", type=str, required=True, help="S3 객체 키 예: <user_id>/<dimension>/<job_id>/input.mp4")
+    parser.add_argument("--dimension", type=str, choices=['2d', '3d'], required=True, help="처리할 스켈레톤 차원")
     parser.add_argument("--api-url", type=str, default=API_URL, help="API 엔드포인트 URL (기본: %(default)s)")
     parser.add_argument("--turbo", action="store_true", help="turbo_without_skeleton 모드 사용")
 
     args = parser.parse_args()
 
+    API_URL = args.api_url
     s3_key = args.s3_key
-    input_root = Path(args.input_root)
-    output_dir = Path(args.output)
-
-    process_video_to_2d_csv_from_s3key(s3_key, input_root, output_dir, turbo=args.turbo)
+    dimension = args.dimension
+    send_request_for_s3key(s3_key, dimension, api_url=API_URL, turbo=args.turbo)
 
 if __name__ == "__main__":
     main()
+
+# 입력 명령어 예시
+# python skeleton_metric-client.py --s3-key c4282d5c-5091-7071-aa3d-6f5d97e2fd8e/3d/d70b7ead-4e14-48f5-a92c-11698399ca3b.zip --dimension 3d --api-url http://localhost:19030/skeleton_metric_predict

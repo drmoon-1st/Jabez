@@ -5,7 +5,7 @@ import tempfile
 import subprocess
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 
@@ -193,10 +193,6 @@ def OpenPoseProcessVideo(base64_video: str) -> List[List[List[List[float]]]]:
                     cap.release()
                     # Now run OpenPose on the frames directory
                     run_openpose_on_dir(frames_dir, output_json_dir, output_img_dir)
-                except Exception:
-                    traceback.print_exc()
-                    # As a last resort, return empty list
-                    return []
                 except Exception:
                     traceback.print_exc()
                     # As a last resort, return empty list

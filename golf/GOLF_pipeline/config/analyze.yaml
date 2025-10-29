@@ -1,19 +1,24 @@
+
+# 최상위 주소
+# BASE_ROOT: "/Users/ihyeonjun/Documents"
+BASE_ROOT: "D:"
+
 # 입력(캡처 산출물)
-img_dir: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/color"
+img_dir: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/input"
 
 # CSV 경로 분리: 2D 오버레이 vs 3D 메트릭스
-overlay_csv_path: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/result/skeleton2d (2).csv"
-metrics_csv_path: "/Users/ihyeonjun/Documents/output/swing_20251002_145443/skeleton3d_interp.csv"
+overlay_csv_path: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/input/skeleton2d.csv"
+metrics_csv_path: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/swing_20251002_145443/skeleton3d_interp.csv"
 
 # (호환용) 단일 CSV를 사용하는 기존 파이프라인을 위한 fallback 경로
-# csv_path: "/Users/ihyeonjun/Documents/golf_anal/output/skeleton2d3d.csv"
+csv_path: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/input/skeleton2d.csv"
 
 # 메트릭 결과
-metrics_csv: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/metrics.csv"
+metrics_csv: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/metrics.csv"
 
 # 오버레이 영상 (선택)
 make_overlay: true
-overlay_mp4: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/overlay.mp4"
+overlay_mp4: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/test/overlay.mp4"
 fps: 30
 codec: "mp4v"
 
@@ -57,11 +62,11 @@ landmarks:
 
 # CSV → JSON 내보내기 설정 (csv_to_json.py에서 사용)
 json_export:
-  input: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test"   # CSV들이 있는 폴더 또는 단일 CSV 파일 경로
-  output_dir: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test"  # 생략 시 input과 동일 폴더 사용
+  input: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/test"   # CSV들이 있는 폴더 또는 단일 CSV 파일 경로
+  output_dir: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/test"  # 생략 시 input과 동일 폴더 사용
   pattern: "*.csv"                 # 폴더 입력 시 대상 CSV 패턴
   orient: "records"               # records|split|index|columns|values|table
   indent: 2                        # records 모드 들여쓰기
   ensure_ascii: false              # true면 한글 ASCII 이스케이프
-  merge_output: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/all_metrics.json"  # 모든 CSV를 하나의 JSON으로 병합 저장
+  merge_output: "${BASE_ROOT}/Jabez/golf/GOLF_pipeline/output/test/all_metrics.json"  # 모든 CSV를 하나의 JSON으로 병합 저장
   merge_mode: "by-file"           # by-file: {"csv_stem": [records...]}, concat: [{source, ...}]

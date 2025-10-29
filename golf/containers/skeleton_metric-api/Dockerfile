@@ -18,7 +18,6 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 # a preexisting PYTHONPATH variable).
 ENV PYTHONPATH=/opt/skeleton_metric-api
 
-
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
 	python3-pip \
@@ -31,6 +30,8 @@ WORKDIR /opt/skeleton_metric-api
 # Copy API server code
 COPY api_server.py /opt/skeleton_metric-api/api_server.py
 COPY ./openpose /opt/skeleton_metric-api/openpose
+COPY controller.py /opt/skeleton_metric-api/controller.py
+COPY ./metric_algorithm /opt/skeleton_metric-api/metric_algorithm
 
 
 # Copy pose_iter_440000.caffemodel to the correct model directory
@@ -40,7 +41,10 @@ COPY pose_iter_440000.caffemodel /opt/openpose/models/pose/coco/pose_iter_440000
 
 # Install Python dependencies
 COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install -r requirements.txt
+
+# Optional runtime environment variables (can be overridden at docker run)
+ENV RECEIVED_PAYLOAD_DIR=/opt/skeleton_metric-api/received_payloads
 
 # Expose port
 EXPOSE 19030
