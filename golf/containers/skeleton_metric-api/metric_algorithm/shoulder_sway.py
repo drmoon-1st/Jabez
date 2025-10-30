@@ -283,3 +283,28 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def run_from_context(ctx: dict):
+    """Standardized runner for shoulder_sway. Produces overlay mp4 only."""
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = ctx.get('job_id', 'job')
+        fps = int(ctx.get('fps', 30))
+        wide2 = ctx.get('wide2')
+        ensure_dir(dest)
+        out = {}
+        overlay_path = dest / f"{job_id}_shoulder_sway_overlay.mp4"
+        if wide2 is not None:
+            try:
+                img_dir = Path(ctx.get('img_dir', dest))
+                lm = ctx.get('landmarks', {}) or {}
+                overlay_sway(img_dir, wide2, overlay_path, fps, 'mp4v', lm)
+                out['overlay_mp4'] = str(overlay_path)
+            except Exception as e:
+                out.setdefault('overlay_error', str(e))
+        else:
+            out['overlay_mp4'] = None
+        return out
+    except Exception as e:
+        return {'error': str(e)}

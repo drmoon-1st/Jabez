@@ -556,3 +556,55 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_from_context(ctx: dict):
+    """Standardized runner for head_speed.
+
+    Returns dict with metrics_csv, overlay_mp4 (if any), and summary statistics.
+    """
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = ctx.get('job_id', 'job')
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        ensure_dir(dest)
+
+        out = {}
+        if wide3 is not None:
+            try:
+                pts, speed, deviations, stability_metrics, unit = compute_head_speed_3d(wide3, 'Nose', fps)
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(len(wide3))),
+                    'head_speed': list(map(float, speed.tolist())),
+                    'head_x': list(map(lambda x: float(x) if not np.isnan(x) else None, pts[:,0].tolist())),
+                    'head_y': list(map(lambda x: float(x) if not np.isnan(x) else None, pts[:,1].tolist())),
+                    'head_z': list(map(lambda x: float(x) if not np.isnan(x) else None, pts[:,2].tolist())),
+                })
+                out_csv = dest / f"{job_id}_head_speed_metrics.csv"
+                metrics_df.to_csv(out_csv, index=False)
+                out['metrics_csv'] = str(out_csv)
+                out['summary'] = {
+                    'mean_head_speed': float(np.nanmean(speed)),
+                    'max_head_speed': float(np.nanmax(speed)),
+                    'stability_metrics': stability_metrics,
+                    'unit': unit,
+                }
+            except Exception as e:
+                return {'error': str(e)}
+
+        # overlay
+        overlay_path = dest / f"{job_id}_head_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                img_dir = Path(ctx.get('img_dir', dest))
+                # head overlay uses Nose by default
+                overlay_head_video(img_dir, wide2, *compute_head_speed_3d(wide3, 'Nose', fps)[:3], compute_head_speed_3d(wide3, 'Nose', fps)[4], 'Nose', overlay_path, fps, 'mp4v')
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}

@@ -523,3 +523,47 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_from_context(ctx: dict):
+    """Standardized runner for swing_speed."""
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = ctx.get('job_id', 'job')
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        ensure_dir(dest)
+        out = {}
+        if wide3 is not None:
+            try:
+                lm_cfg = {'wrist_left': 'LWrist', 'wrist_right': 'RWrist'}
+                wrist_l = lm_cfg.get('wrist_left')
+                wrist_r = lm_cfg.get('wrist_right')
+                grip_pts, R_pts, L_pts, R_speed, L_speed = compute_grip_points_3d(wide3, wrist_r, wrist_l)
+                swing_v, unit = speed_3d(grip_pts, fps)
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(len(wide3))),
+                    'swing_speed': list(map(float, swing_v.tolist())),
+                    'r_wrist_speed': list(map(float, R_speed.tolist())),
+                    'l_wrist_speed': list(map(float, L_speed.tolist())),
+                })
+                out_csv = dest / f"{job_id}_swing_speed_metrics.csv"
+                metrics_df.to_csv(out_csv, index=False)
+                out['metrics_csv'] = str(out_csv)
+                out['summary'] = {'mean_swing_speed': float(np.nanmean(swing_v)), 'max_swing_speed': float(np.nanmax(swing_v)), 'unit': unit}
+            except Exception as e:
+                return {'error': str(e)}
+
+        overlay_path = dest / f"{job_id}_swing_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                img_dir = Path(ctx.get('img_dir', dest))
+                overlay_swing_video(img_dir, wide2, grip_pts if 'grip_pts' in locals() else np.zeros((len(wide2),3)), R_pts if 'R_pts' in locals() else None, L_pts if 'L_pts' in locals() else None, swing_v if 'swing_v' in locals() else np.zeros(len(wide2)), R_speed if 'R_speed' in locals() else None, L_speed if 'L_speed' in locals() else None, unit if 'unit' in locals() else 'mm/frame', overlay_path, fps, 'mp4v', wrist_r, wrist_l)
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}

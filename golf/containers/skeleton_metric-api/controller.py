@@ -76,52 +76,57 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         s3 = boto3.client('s3')
         key = s3_key.lstrip('/')
 
-        # Use /tmp for temporary work (Docker-friendly) and auto-clean via TemporaryDirectory
-        with tempfile.TemporaryDirectory(dir='/tmp') as tmpdir:
-            tmp_dir = Path(tmpdir)
-            output_json_dir = tmp_dir / 'json'
-            output_json_dir.mkdir(parents=True, exist_ok=True)
-            output_img_dir = tmp_dir / 'img'
-            output_img_dir.mkdir(parents=True, exist_ok=True)
+        # Use /tmp for temporary work (Docker-friendly).
+        # For debugging, create a persistent tmp dir (mkdtemp) so files are not auto-deleted.
+        # NOTE: this is intentionally persistent for debugging; remember to clean up manually.
+        tmpdir = tempfile.mkdtemp(dir='/tmp')
+        tmp_dir = Path(tmpdir)
+        # If you later want automatic cleanup, replace above with:
+        # with tempfile.TemporaryDirectory(dir='/tmp') as tmpdir:
+        #     tmp_dir = Path(tmpdir)
+        output_json_dir = tmp_dir / 'json'
+        output_json_dir.mkdir(parents=True, exist_ok=True)
+        output_img_dir = tmp_dir / 'img'
+        output_img_dir.mkdir(parents=True, exist_ok=True)
 
-            result_by_frame = []
+        result_by_frame = []
 
-            if dimension == '2d':
-                # download mp4 and run openpose on video
-                local_video = tmp_dir / 'input.mp4'
-                s3.download_file(bucket, key, str(local_video))
-                run_openpose_on_video(str(local_video), str(output_json_dir), str(output_img_dir))
+        if dimension == '2d':
+            # download mp4 and run openpose on video
+            local_video = tmp_dir / 'input.mp4'
+            s3.download_file(bucket, key, str(local_video))
+            run_openpose_on_video(str(local_video), str(output_json_dir), str(output_img_dir))
 
-                # parse JSON outputs (sorted by filename) and build an in-memory pandas DataFrame (long/tidy)
-                json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
-                rows = []  # rows for DataFrame
-                for frame_idx, jp in enumerate(json_paths):
-                    with jp.open('r', encoding='utf-8') as f:
-                        jdata = json.load(f)
-                    raw_people = jdata.get('people', [])
-                    ppl = []
-                    for person_idx, p in enumerate(raw_people):
-                        if 'pose_keypoints_2d' in p:
-                            kps = p['pose_keypoints_2d']
-                            person = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
-                            person = _sanitize_person_list(person)
-                            ppl.append(person)
-                    result_by_frame.append(ppl)
+            # parse JSON outputs (sorted by filename) and build an in-memory pandas DataFrame (long/tidy)
+            json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
+            rows = []  # rows for DataFrame
+            for frame_idx, jp in enumerate(json_paths):
+                with jp.open('r', encoding='utf-8') as f:
+                    jdata = json.load(f)
+                raw_people = jdata.get('people', [])
+                ppl = []
+                for person_idx, p in enumerate(raw_people):
+                    if 'pose_keypoints_2d' in p:
+                        kps = p['pose_keypoints_2d']
+                        person = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
+                        person = _sanitize_person_list(person)
+                        ppl.append(person)
+                result_by_frame.append(ppl)
 
-                    # convert to long-format rows: one row per joint per person
-                    for person_idx, person in enumerate(ppl):
-                        for joint_idx, (x, y, c) in enumerate(person):
-                            rows.append({
-                                'frame': frame_idx,
-                                'person_idx': person_idx,
-                                'joint_idx': joint_idx,
-                                'x': float(x),
-                                'y': float(y),
-                                'conf': float(c)
-                            })
+                # convert to long-format rows: one row per joint per person
+                for person_idx, person in enumerate(ppl):
+                    for joint_idx, (x, y, c) in enumerate(person):
+                        rows.append({
+                            'frame': frame_idx,
+                            'person_idx': person_idx,
+                            'joint_idx': joint_idx,
+                            'x': float(x),
+                            'y': float(y),
+                            'conf': float(c)
+                        })
 
-                df_2d = pd.DataFrame(rows)
-            elif dimension == '3d':
+            df_2d = pd.DataFrame(rows)
+        elif dimension == '3d':
                 # download zip and extract expected color/ and depth/ folders
                 local_zip = tmp_dir / 'input.zip'
                 s3.download_file(bucket, key, str(local_zip))
@@ -156,8 +161,156 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 if not color_dir.exists() or not depth_dir.exists():
                     raise RuntimeError('Expected color/ and depth/ folders in zip')
 
+                # Build a sorted list of depth files as a robust fallback mapping
+                depth_files = sorted([p for p in depth_dir.iterdir() if p.suffix == '.npy'])
+                depth_count = len(depth_files)
+                depth_map_info = {'depth_count': depth_count}
+
+                # Try to discover intrinsics recursively in the extracted tree so we can
+                # use any recorded meta (e.g., depth_scale or color width/height)
+                intr = None
+                intr_source = None
+                try:
+                    # look in obvious places first, then do a recursive search
+                    intr_candidates = [tmp_dir / 'intrinsics.json', color_dir / 'intrinsics.json', depth_dir / 'intrinsics.json']
+                    if not any([c.exists() for c in intr_candidates]):
+                        for cand in tmp_dir.rglob('*.json'):
+                            try:
+                                txt = cand.read_text(encoding='utf-8')
+                                if 'cx' in txt and 'fx' in txt:
+                                    intr_candidates.append(cand)
+                                    break
+                            except Exception:
+                                continue
+                    for cand in intr_candidates:
+                        if not cand or not Path(cand).exists():
+                            continue
+                        try:
+                            intr_full_try = json.loads(Path(cand).read_text(encoding='utf-8'))
+                            for key in ('color_intrinsics', 'intrinsics', 'intrinsics_color', 'camera_intrinsics'):
+                                if key in intr_full_try:
+                                    intr = intr_full_try.get(key)
+                                    intr_source = str(cand)
+                                    intr_full = intr_full_try
+                                    break
+                            if intr is None and isinstance(intr_full_try, dict) and all(k in intr_full_try for k in ('cx', 'cy', 'fx', 'fy')):
+                                intr = intr_full_try
+                                intr_source = str(cand)
+                                intr_full = intr_full_try
+                            if intr is not None:
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    intr = None
+
+                # Early validation: sample up to 10 depth files evenly to check dtype/shape and valid pixels
+                depth_validation = []
+                try:
+                    if depth_count == 0:
+                        # persist validation info for debugging
+                        (Path(dest_dir) / 'depth_validation.json').write_text(json.dumps({'error': 'no_npy_files'}, indent=2))
+                        raise RuntimeError('No depth .npy files found in depth directory')
+
+                    # choose up to 10 samples evenly spaced
+                    sample_n = min(10, depth_count)
+                    if sample_n <= 0:
+                        sample_idxs = []
+                    else:
+                        step = max(1, depth_count // sample_n)
+                        sample_idxs = list(range(0, depth_count, step))[:sample_n]
+
+                    invalid_samples = 0
+                    for idx in sample_idxs:
+                        p = depth_files[idx]
+                        stat = {'name': p.name}
+                        try:
+                            arr = np.load(str(p))
+                            stat['dtype'] = str(arr.dtype)
+                            stat['shape'] = arr.shape
+                            total = int(arr.size)
+                            finite = np.isfinite(arr)
+                            finite_count = int(finite.sum())
+                            valid = finite & (arr > 0)
+                            valid_count = int(valid.sum())
+                            stat['total_pixels'] = total
+                            stat['finite_count'] = finite_count
+                            stat['valid_count'] = valid_count
+                            stat['min'] = float(np.nanmin(arr[finite])) if finite.any() else None
+                            stat['max'] = float(np.nanmax(arr[finite])) if finite.any() else None
+                            stat['median_valid'] = float(np.nanmedian(arr[valid])) if valid.any() else None
+                            if valid_count == 0:
+                                invalid_samples += 1
+                        except Exception as e:
+                            stat['error'] = str(e)
+                            invalid_samples += 1
+                        depth_validation.append(stat)
+
+                    # persist validation info for debugging
+                    try:
+                        (Path(dest_dir) / 'depth_validation.json').write_text(json.dumps(depth_validation, indent=2))
+                    except Exception:
+                        pass
+
+                    # Infer a depth scale factor (raw units -> meters). Heuristic:
+                    # - if intrinsics file contained meta.depth_scale, prefer that
+                    # - else if samples show integer dtype or median_valid > 1000, assume mm -> m
+                    depth_scale_factor = 1.0
+                    inferred_unit = 'meters'
+                    try:
+                        if 'intr_full' in locals() and isinstance(intr_full, dict):
+                            meta = intr_full.get('meta') or intr_full.get('meta_data') or {}
+                            if isinstance(meta, dict) and 'depth_scale' in meta:
+                                # intr_full may have depth_scale if raw depth was saved; prefer it
+                                try:
+                                    ds = float(meta.get('depth_scale'))
+                                    if ds != 0 and ds != 1.0:
+                                        depth_scale_factor = ds
+                                        inferred_unit = f'raw_scale_{ds}'
+                                except Exception:
+                                    pass
+                        # fallback heuristic based on sample stats
+                        if depth_scale_factor == 1.0:
+                            for s in depth_validation:
+                                md = s.get('median_valid')
+                                dt = s.get('dtype','')
+                                if (md is not None and md > 1000) or ('int' in dt.lower() and (s.get('max') or 0) > 1000):
+                                    depth_scale_factor = 0.001
+                                    inferred_unit = 'millimeters'
+                                    break
+                    except Exception:
+                        pass
+
+                    # record inferred scale into depth_map_info for diagnostics
+                    try:
+                        depth_map_info['inferred_depth_scale'] = depth_scale_factor
+                        depth_map_info['inferred_unit'] = inferred_unit
+                        if intr_source:
+                            depth_map_info['intrinsic_source'] = intr_source
+                        (Path(dest_dir) / 'depth_map_info.json').write_text(json.dumps(depth_map_info, indent=2))
+                    except Exception:
+                        pass
+
+                    # If all sampled depth files are invalid, bail out early with an error log
+                    if len(sample_idxs) > 0 and invalid_samples >= len(sample_idxs):
+                        err_msg = f"All sampled depth .npy files appear invalid (depth_count={depth_count}). Aborting 3D processing."
+                        try:
+                            (Path(dest_dir) / 'result_error.txt').write_text(err_msg)
+                        except Exception:
+                            pass
+                        return {'message': 'ERROR', 'detail': err_msg}
+                except Exception as e:
+                    # If validation discovery itself fails, log and continue to attempt processing
+                    try:
+                        (Path(dest_dir) / 'depth_validation_error.txt').write_text(traceback.format_exc())
+                    except Exception:
+                        pass
+
                 # Run OpenPose on color images directory
-                run_openpose_on_dir(str(color_dir), str(output_json_dir), str(output_img_dir))
+                # Note: openpose.openpose expects an "output_img_path" whose dirname() is used
+                # for the --write_images flag. To ensure images go into output_img_dir, pass
+                # a file path under that directory (the dirname will then be output_img_dir).
+                run_openpose_on_dir(str(color_dir), str(output_json_dir), str(output_img_dir / 'out'))
 
                 # Pair JSON outputs with depth .npy by frame index ordering and build DataFrame
                 json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
@@ -195,7 +348,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     dbg = {
                         'color_files': [p.name for p in sorted(color_dir.iterdir())[:50]],
                         'depth_files': [p.name for p in depth_files[:50]],
-                        'intrinsic_source': intr_source if 'intr_source' in locals() else None,
+                        'intrinsic_source': intr_source if 'intr_source' in locals() else (intr_source if 'intr_source' not in locals() and 'intr_source' in globals() else None),
                     }
                     # write to dest_dir (persist across tmpdir removal)
                     try:
@@ -244,15 +397,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             ppl.append(person)
                     result_by_frame.append(ppl)
 
-                    # compute 3D coordinates using intrinsics if intrinsics.json exists
-                    intr_json = tmp_dir / 'intrinsics.json'
-                    intr = None
-                    if intr_json.exists():
-                        try:
-                            intr_full = json.loads(intr_json.read_text(encoding='utf-8'))
-                            intr = intr_full.get('color_intrinsics')
-                        except Exception:
-                            intr = None
+                    # compute 3D coordinates using intrinsics (found earlier in the tmp tree)
+                    # NOTE: do not reassign `intr` here; it was discovered earlier and should persist
 
                     for person_idx, person in enumerate(ppl):
                         for joint_idx, (x, y, c) in enumerate(person):
@@ -331,7 +477,57 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     pass
 
                 df_3d = pd.DataFrame(rows)
-            # end with TemporaryDirectory
+
+                # Persist OpenPose rendered images into dest_dir BEFORE tmpdir is removed so operators
+                # and metric modules can access them. This avoids images disappearing when TemporaryDirectory
+                # context manager removes the tmpdir at the end of the with block.
+                try:
+                    dest_img_dir = Path(dest_dir) / 'img'
+                    dest_img_dir.mkdir(parents=True, exist_ok=True)
+                    if output_img_dir.exists():
+                        for p in sorted(output_img_dir.iterdir()):
+                            try:
+                                if p.is_file():
+                                    shutil.copy2(str(p), str(dest_img_dir / p.name))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # If no overlay mp4 yet, create a simple mp4 from copied images (written into dest_dir)
+                try:
+                    imgs = sorted([p for p in dest_img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if dest_img_dir.exists() else []
+                    if imgs:
+                        try:
+                            import cv2
+                            h, w = None, None
+                            for p in imgs:
+                                im = cv2.imread(str(p))
+                                if im is None:
+                                    continue
+                                h, w = im.shape[:2]
+                                break
+                            if h is not None and w is not None:
+                                out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                vw = cv2.VideoWriter(str(out_mp4), fourcc, 30.0, (w, h))
+                                for p in imgs:
+                                    im = cv2.imread(str(p))
+                                    if im is None:
+                                        continue
+                                    if im.shape[1] != w or im.shape[0] != h:
+                                        im = cv2.resize(im, (w, h))
+                                    vw.write(im)
+                                vw.release()
+                        except Exception:
+                            # ignore if OpenCV not available or fails
+                            pass
+                except Exception:
+                    pass
+
+            # end of tmp work; we intentionally DO NOT remove tmp_dir here so files remain for debugging
+            # If automatic cleanup is desired, uncomment the following line to remove the tmp dir:
+            # shutil.rmtree(str(tmp_dir))
 
         # after temp work is done, validate dimension and build interpolated sequence
         if dimension not in ('2d', '3d'):

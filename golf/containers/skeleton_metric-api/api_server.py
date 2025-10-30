@@ -62,7 +62,7 @@ async def skeleton_metric_predict(req: OpenPoseRequest, background_tasks: Backgr
         base_dir = Path(os.environ.get('RECEIVED_PAYLOAD_DIR', Path.cwd() / 'received_payloads'))
         user_id = user_id or 'unknown_user'
         job_id = job_id or f'job_{int(os.times()[4])}'
-        dest_dir = base_dir / user_id / job_id
+        dest_dir = base_dir / user_id / job_id  # /opt/skeleton_metric-api/<user_id>/<job_id>/ 폴더
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # save sanitized payload metadata

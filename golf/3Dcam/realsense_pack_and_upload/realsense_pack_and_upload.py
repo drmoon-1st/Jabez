@@ -101,6 +101,9 @@ class RealsenseRecorder:
         try:
             depth_sensor = profile.get_device().first_depth_sensor()
             depth_scale = depth_sensor.get_depth_scale()
+            # We'll capture intrinsics on the first valid color frame and persist them
+            # so that packages uploaded to the server include camera intrinsics and depth_scale.
+            intr = None
             self._running.set()
             self._idx = 0
             while not self._stop_event.is_set():
@@ -110,6 +113,30 @@ class RealsenseRecorder:
                 color = frames.get_color_frame()
                 if not depth or not color:
                     continue
+
+                # discover and persist intrinsics on first successful frame
+                if intr is None:
+                    try:
+                        ci = color.profile.as_video_stream_profile().intrinsics
+                        intr = {
+                            "width": ci.width,
+                            "height": ci.height,
+                            "fx": float(ci.fx),
+                            "fy": float(ci.fy),
+                            "cx": float(ci.ppx),
+                            "cy": float(ci.ppy),
+                            "coeffs": [float(c) for c in getattr(ci, 'coeffs', [])]
+                        }
+                        meta = {"fps": self.fps, "width": self.width, "height": self.height, "depth_scale": float(depth_scale)}
+                        intr_obj = {"color_intrinsics": intr, "meta": meta}
+                        try:
+                            (self.out_dir / "intrinsics.json").write_text(json.dumps(intr_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+                        except Exception:
+                            # ignore write failures (don't break recording)
+                            pass
+                    except Exception:
+                        # if intrinsics extraction fails, keep intr as None and continue
+                        intr = None
 
                 color_img = np.asanyarray(color.get_data())
                 depth_raw = np.asanyarray(depth.get_data())

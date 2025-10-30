@@ -884,3 +884,65 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_from_context(ctx: dict):
+    """Standardized runner for com_speed.
+
+    Returns JSON-serializable dict with keys:
+      - metrics_csv: path
+      - overlay_mp4: path (if produced)
+      - summary: dict of simple numeric summaries
+    """
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = ctx.get('job_id', 'job')
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        ensure_dir(dest)
+
+        out = {}
+
+        # Metrics (3D)
+        if wide3 is not None:
+            try:
+                com_pts = compute_com_points_3d(wide3)
+                v, unit = speed_3d(com_pts, fps)
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(len(wide3))),
+                    'com_speed': list(map(float, v.tolist())),
+                    'com_x': list(map(lambda x: float(x) if not np.isnan(x) else None, com_pts[:, 0].tolist())),
+                    'com_y': list(map(lambda x: float(x) if not np.isnan(x) else None, com_pts[:, 1].tolist())),
+                    'com_z': list(map(lambda x: float(x) if not np.isnan(x) else None, com_pts[:, 2].tolist())),
+                })
+                metrics_csv = dest / f"{job_id}_com_speed_metrics.csv"
+                ensure_dir(metrics_csv.parent)
+                metrics_df.to_csv(metrics_csv, index=False)
+                out['metrics_csv'] = str(metrics_csv)
+                out['summary'] = {
+                    'mean_com_speed': float(np.nanmean(v)) if len(v) > 0 else None,
+                    'max_com_speed': float(np.nanmax(v)) if len(v) > 0 else None,
+                    'unit': unit,
+                }
+            except Exception as e:
+                return {'error': f'com_speed metrics failure: {e}'}
+        else:
+            out['metrics_csv'] = None
+
+        # Overlay (2D)
+        overlay_path = dest / f"{job_id}_com_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                com2d = compute_com_points_2d(wide2)
+                # ensure img_dir is present in ctx, default to dest
+                img_dir = Path(ctx.get('img_dir', dest))
+                overlay_com_video(img_dir, wide2, com2d, v if 'v' in locals() else np.zeros(len(com2d)), unit if 'unit' in locals() else 'mm/frame', overlay_path, fps, 'mp4v')
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            # non-fatal; record error
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}

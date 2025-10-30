@@ -489,3 +489,45 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_from_context(ctx: dict):
+    """Standardized runner for xfactor."""
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = ctx.get('job_id', 'job')
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        ensure_dir(dest)
+        out = {}
+        if wide3 is not None:
+            try:
+                shoulder_l = 'LShoulder'; shoulder_r = 'RShoulder'; hip_l = 'LHip'; hip_r = 'RHip'
+                xfactor_vals, shoulder_angles, hip_angles = compute_xfactor_series(wide3, shoulder_l, shoulder_r, hip_l, hip_r)
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(len(wide3))),
+                    'xfactor_deg': list(map(float, xfactor_vals.tolist())),
+                    'shoulder_angle': list(map(float, shoulder_angles.tolist())),
+                    'hip_angle': list(map(float, hip_angles.tolist())),
+                })
+                out_csv = dest / f"{job_id}_xfactor_metrics.csv"
+                metrics_df.to_csv(out_csv, index=False)
+                out['metrics_csv'] = str(out_csv)
+                out['summary'] = {'mean_xfactor': float(np.nanmean(xfactor_vals)), 'max_xfactor': float(np.nanmax(xfactor_vals))}
+            except Exception as e:
+                return {'error': str(e)}
+
+        overlay_path = dest / f"{job_id}_xfactor_overlay.mp4"
+        try:
+            if wide2 is not None:
+                img_dir = Path(ctx.get('img_dir', dest))
+                joints = ['LShoulder', 'RShoulder', 'LHip', 'RHip']
+                overlay_xfactor_video(img_dir, wide2, xfactor_vals if 'xfactor_vals' in locals() else np.zeros(len(wide2)), shoulder_angles if 'shoulder_angles' in locals() else None, hip_angles if 'hip_angles' in locals() else None, overlay_path, fps, 'mp4v', joints)
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}
