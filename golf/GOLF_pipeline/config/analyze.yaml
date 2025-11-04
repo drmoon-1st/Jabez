@@ -1,19 +1,20 @@
-# 입력(캡처 산출물)
-img_dir: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/color"
+# 입력(영상으로. png폴더) 
+img_dir: "/Users/ihyeonjun/Documents/output/swing_20251002_150033/color"
 
 # CSV 경로 분리: 2D 오버레이 vs 3D 메트릭스
-overlay_csv_path: "/Users/ihyeonjun/Documents/Jabez/golf/3Dcam/docker-openpose/result/skeleton2d (2).csv"
-metrics_csv_path: "/Users/ihyeonjun/Documents/output/swing_20251002_145443/skeleton3d_interp.csv"
+overlay_csv_path: "/Users/ihyeonjun/Documents/output/swing_20251002_150033/skeleton2d_interp.csv"
+metrics_csv_path: "/Users/ihyeonjun/Documents/output/swing_20251002_150033/skeleton3d_interp.csv"
+
 
 # (호환용) 단일 CSV를 사용하는 기존 파이프라인을 위한 fallback 경로
 # csv_path: "/Users/ihyeonjun/Documents/golf_anal/output/skeleton2d3d.csv"
 
 # 메트릭 결과
-metrics_csv: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/metrics.csv"
+metrics_csv: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/swing_20251002_150033/metrics.csv"
 
 # 오버레이 영상 (선택)
 make_overlay: true
-overlay_mp4: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/test/overlay.mp4"
+overlay_mp4: "/Users/ihyeonjun/Documents/Jabez/golf/GOLF_pipeline/output/swing_20251002_150033/overlay.mp4"
 fps: 30
 codec: "mp4v"
 

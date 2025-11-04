@@ -16,6 +16,11 @@ import math
 from typing import Optional
 
 try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:
     import yaml
 except ImportError:
     yaml = None
@@ -218,6 +223,116 @@ def speed_3d(points_xyz: np.ndarray, fps):
     v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
     return v, unit
 
+def vectorized_speed_m_s(points_xyz: np.ndarray, fps: int) -> np.ndarray:
+    """
+    벡터화된 손목 3D 속도(m/s) 계산
+      Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2)
+      Δt = 1 / fps
+      v = Δs / Δt = Δस * fps
+    좌표 단위가 'm'일 때 사용
+    """
+    if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+        return np.full((len(points_xyz),), np.nan, dtype=float)
+    X = points_xyz.astype(float).copy()
+    for c in range(3):
+        s = pd.Series(X[:, c])
+        s = s.interpolate(limit_direction='both').fillna(method='ffill').fillna(method='bfill')
+        X[:, c] = s.to_numpy()
+    dx = np.diff(X[:, 0], prepend=X[0, 0])
+    dy = np.diff(X[:, 1], prepend=X[0, 1])
+    dz = np.diff(X[:, 2], prepend=X[0, 2])
+    ds = np.sqrt(dx**2 + dy**2 + dz**2)
+    v_m_s = ds * float(fps if fps and fps > 0 else 30)
+    if len(v_m_s) > 0:
+        v_m_s[0] = 0.0
+    return v_m_s
+
+def _speed_conversions_m_s(v_m_s: np.ndarray):
+    """m/s 배열을 km/h, mph로 동시 변환"""
+    v_kmh = v_m_s * 3.6
+    v_mph = v_m_s * 2.23694
+    return v_m_s, v_kmh, v_mph
+
+def detect_impact_by_crossing(wrist_x: np.ndarray, stance_mid_x: np.ndarray) -> int:
+    """X 증가(+) 방향으로 스탠스 중앙을 넘는 첫 프레임을 임팩트로 탐지"""
+    N = len(wrist_x)
+    impact = -1
+    for i in range(1, N):
+        if np.isnan(wrist_x[i]) or np.isnan(wrist_x[i-1]) or np.isnan(stance_mid_x[i]) or np.isnan(stance_mid_x[i-1]):
+            continue
+        crossed = (wrist_x[i-1] < stance_mid_x[i-1]) and (wrist_x[i] >= stance_mid_x[i])
+        positive_dx = (wrist_x[i] - wrist_x[i-1]) > 0
+        if crossed and positive_dx:
+            impact = i
+            break
+    if impact == -1:
+        with np.errstate(invalid='ignore'):
+            impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
+    return impact
+
+def analyze_wrist_speed(df: pd.DataFrame, fps: int, wrist: str = "RWrist"):
+    """
+    입력: 3D CSV (mm), 필수: {wrist}_X3D/Y3D/Z3D, RAnkle_X3D, LAnkle_X3D
+    출력:
+      - impact_frame, peak_frame
+      - 시계열 속도 v_mm_s, v_m_s, v_km_h, v_mph
+      - 피크 속도(손목) km/h, mph
+      - 클럽 헤드 추정 속도(k=1.35) 및 범위(k=1.25~1.55)
+    """
+    W = get_xyz_cols(df, wrist)         # (N,3) mm
+    RA = get_xyz_cols(df, 'RAnkle')     # (N,3)
+    LA = get_xyz_cols(df, 'LAnkle')     # (N,3)
+    wx = W[:, 0]
+    stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
+    # 3D 손목 속도 (m/s) - 좌표 단위가 'm'이라는 전제
+    v_m_s = vectorized_speed_m_s(W, fps)
+    v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
+    # 임팩트 프레임 탐지
+    impact = detect_impact_by_crossing(wx, stance_mid_x)
+    # ±2 프레임 내 피크 속도
+    lo = max(0, impact - 2)
+    hi = min(len(v_kmh) - 1, impact + 2)
+    peak_local_idx = lo + int(np.nanargmax(v_kmh[lo:hi+1])) if hi >= lo else int(np.nanargmax(v_kmh))
+    peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
+    peak_wrist_mph = float(peak_wrist_kmh / 1.609344)
+    # 클럽 헤드 추정 (가중치)
+    k = 1.35
+    k_min, k_max = 1.25, 1.55
+    club_kmh = peak_wrist_kmh * k
+    club_mph = peak_wrist_mph * k
+    club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
+    club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+    return {
+        'impact_frame': int(impact),
+        'peak_frame': int(peak_local_idx),
+        'v_m_s': v_m_s,
+        'v_km_h': v_kmh,
+        'v_mph': v_mph,
+        'wrist_peak_kmh': peak_wrist_kmh,
+        'wrist_peak_mph': peak_wrist_mph,
+        'club_kmh': club_kmh,
+        'club_mph': club_mph,
+        'club_kmh_range': (club_kmh_min, club_kmh_max),
+        'club_mph_range': (club_mph_min, club_mph_max),
+    }
+
+def categorize_head_speed_mph(head_mph: float):
+    """주어진 클럽 헤드 속도(mph)가 어떤 집단 평균에 가장 가까운지 멘트 구성"""
+    refs = [
+        ("Female Amateur", 78),
+        ("Male Amateur", 93),
+        ("LPGA Tour Pro", 94),
+        ("PGA Tour Pro (avg male pro)", 114),
+        ("Long Driver", 135),
+        ("World Record", 157),
+    ]
+    # 가장 가까운 카테고리 선택
+    best = min(refs, key=lambda kv: abs(head_mph - kv[1]))
+    name, ref = best
+    diff = head_mph - ref
+    direction = "빠름" if diff >= 0 else "느림"
+    return f"현재 추정 클럽 헤드 속도는 '{name}' 평균 {ref:.0f} mph와 가장 가깝습니다 (Δ{abs(diff):.1f} mph {direction})."
+
 def load_cfg(p: Path):
     if p.suffix.lower() in (".yml", ".yaml"):
         if yaml is None:
@@ -298,11 +413,20 @@ def compute_overlay_range(df: pd.DataFrame, kp_names):
 # =========================================================
 # Swing Speed 시각화 전용 오버레이
 # =========================================================
-def overlay_swing_video(img_dir: Path, df: pd.DataFrame, grip_points: np.ndarray, 
-                       R_points: np.ndarray, L_points: np.ndarray, swing_speed: np.ndarray, 
-                       R_speed: np.ndarray, L_speed: np.ndarray, swing_unit: str, 
-                       out_mp4: Path, fps: int, codec: str, wrist_r: str, wrist_l: str):
-    """스윙 관련 관절들과 그립 포인트 시각화"""
+def overlay_swing_video(
+    img_dir: Path,
+    df: pd.DataFrame,
+    out_mp4: Path,
+    fps: int,
+    codec: str,
+    wrist_r: str,
+    wrist_l: str,
+):
+    """스윙 관련 관절들과 그립 포인트 시각화
+
+    Note: 사용되지 않던 배열 인자(grip_points, R/L_points, 속도들)는 제거하고
+    DataFrame 중심 API로 단순화했습니다.
+    """
     images = sorted(glob.glob(str(img_dir / "*.png")), key=natural_key)
     if not images:
         images = sorted(glob.glob(str(img_dir / "*.jpg")), key=natural_key)
@@ -461,24 +585,44 @@ def main():
     print(f"📋 Metrics CSV 로드(swing): {metrics_csv} ({len(df_metrics)} frames)")
     print(f"📋 Overlay CSV 로드(swing): {overlay_csv} ({len(df_overlay)} frames)")
 
-    # 2) Grip/Swing 계산
-    grip_pts, R_pts, L_pts, R_speed, L_speed = compute_grip_points_3d(df_metrics, wrist_r, wrist_l)
-    swing_v, swing_unit = speed_3d(grip_pts, fps)
+    # 2) 손목(RWrist) 기반 스윙 스피드 분석 (요청 사양)
+    wrist_name = wrist_r  # 기본 Right wrist
+    anal = analyze_wrist_speed(df_metrics, fps=fps, wrist=wrist_name)
 
-    # 3) 결과 저장
-    metrics = pd.DataFrame({
-        'frame': range(len(df_metrics)),
-        'swing_speed': swing_v,
-        'r_wrist_speed': R_speed,
-        'l_wrist_speed': L_speed,
-        'grip_x': grip_pts[:, 0],
-        'grip_y': grip_pts[:, 1],
-        'grip_z': grip_pts[:, 2]
+    # 3) 시계열 CSV 저장 (frame, wrist_speed_m_s, km/h, mph)
+    ts_csv = out_csv.parent / "wrist_speed_timeseries.csv"
+    ts_df = pd.DataFrame({
+        'frame': np.arange(len(anal['v_m_s'])),
+        'wrist_speed_m_s': anal['v_m_s'],
+        'wrist_speed_km_h': anal['v_km_h'],
+        'wrist_speed_mph': anal['v_mph'],
     })
-    
-    ensure_dir(out_csv.parent)
-    metrics.to_csv(out_csv, index=False)
-    print(f"✅ Swing 메트릭 저장: {out_csv}")
+    ensure_dir(ts_csv.parent)
+    ts_df.to_csv(ts_csv, index=False)
+    print(f"✅ Wrist speed timeseries 저장: {ts_csv}")
+
+    # 4) 시각화(선택): 속도-프레임 그래프 저장
+    plot_png = out_csv.parent / "wrist_speed_plot.png"
+    if plt is not None:
+        try:
+            plt.figure(figsize=(10, 4))
+            plt.plot(ts_df['frame'], ts_df['wrist_speed_km_h'], label='Wrist Speed (km/h)', color='#1f77b4', linewidth=2)
+            # 임팩트/피크 점선
+            imp = anal['impact_frame']; pk = anal['peak_frame']
+            plt.axvline(imp, color='red', linestyle='--', linewidth=1.5, label='Impact')
+            if pk != imp:
+                plt.axvline(pk, color='gray', linestyle='--', linewidth=1.2, label='Peak')
+            plt.xlabel('Frame'); plt.ylabel('Speed (km/h)')
+            plt.title('Wrist Speed over Frames')
+            plt.legend(loc='upper right')
+            plt.tight_layout()
+            plt.savefig(plot_png, dpi=150)
+            plt.close()
+            print(f"✅ Wrist speed 그래프 저장: {plot_png}")
+        except Exception as e:
+            print(f"⚠️ 그래프 저장 실패: {e}")
+    else:
+        print("ℹ️ matplotlib 미설치: 그래프 저장은 건너뜀")
 
     # 4) 비디오 오버레이
     # 4) 비디오 오버레이 (2D 스무딩 적용 가능)
@@ -509,17 +653,32 @@ def main():
     else:
         df_overlay_sm = df_overlay
 
-    overlay_swing_video(img_dir, df_overlay_sm, grip_pts, R_pts, L_pts, swing_v, 
-                       R_speed, L_speed, swing_unit, out_mp4, fps, codec, wrist_r, wrist_l)
+    overlay_swing_video(
+        img_dir=img_dir,
+        df=df_overlay_sm,
+        out_mp4=out_mp4,
+        fps=fps,
+        codec=codec,
+        wrist_r=wrist_r,
+        wrist_l=wrist_l,
+    )
     print(f"✅ Swing 분석 비디오 저장: {out_mp4}")
-    
-    # 5) 통계 출력
-    print(f"\n📊 Swing Speed 분석 결과:")
-    print(f"   평균 Swing Speed: {np.nanmean(swing_v):.2f} {swing_unit}")
-    print(f"   최대 Swing Speed: {np.nanmax(swing_v):.2f} {swing_unit}")
-    print(f"   평균 R-Wrist: {np.nanmean(R_speed):.2f}")
-    print(f"   평균 L-Wrist: {np.nanmean(L_speed):.2f}")
-    print(f"   사용된 관절: [{wrist_l}, {wrist_r}]")
+
+    # 5) 최종 출력 (요청된 형식)
+    wrist_peak_mph = anal['wrist_peak_mph']
+    wrist_peak_kmh = anal['wrist_peak_kmh']
+    club_mph = anal['club_mph']
+    club_kmh = anal['club_kmh']
+    club_mph_min, club_mph_max = anal['club_mph_range']
+    club_kmh_min, club_kmh_max = anal['club_kmh_range']
+
+    print("\n결과")
+    print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph)")
+    print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
+
+    # 6) 카테고리 멘트 (평균 Head Speed 표 기준)
+    comment = categorize_head_speed_mph(club_mph)
+    print(comment)
 
 if __name__ == "__main__":
     main()
