@@ -178,6 +178,84 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 	except Exception:
 		out['overlay_upload_error'] = _tb.format_exc()
 
+	# Expand any metrics CSVs produced by modules into JSON structures so the
+	# combined metrics JSON contains frame-wise data inline (helps downstream clients)
+	try:
+		import csv as _csv
+		def _parse_val(s):
+			# attempt to coerce to int/float, otherwise leave as string
+			if s is None:
+				return None
+			s = str(s)
+			if s == '':
+				return None
+			try:
+				if '.' in s:
+					f = float(s)
+					return int(f) if f.is_integer() else f
+			except Exception:
+				a = None
+			try:
+				return int(s)
+			except Exception:
+				return s
+
+		for name, m in list(out.get('metrics', {}).items()):
+			try:
+				if not isinstance(m, dict):
+					continue
+				# support single metrics_csv path
+				csv_paths = []
+				if 'metrics_csv' in m and m.get('metrics_csv'):
+					csv_paths.append(m.get('metrics_csv'))
+				# support plural key
+				if 'metrics_csvs' in m and isinstance(m.get('metrics_csvs'), (list, tuple)):
+					csv_paths.extend(list(m.get('metrics_csvs')))
+				# if module returned a different key name (e.g., 'metrics'), try to detect csv-like values
+				# process each candidate
+				metrics_expanded = {}
+				for p in csv_paths:
+					if not p:
+						continue
+					p_path = _Path(p)
+					if not p_path.exists():
+						# try relative to dest_dir
+						cand = _Path(out.get('metrics_path') or _Path(dest_dir) / f"{job_id}_metric_result.json").parent / p_path.name
+						if cand.exists():
+							p_path = cand
+						else:
+							m.setdefault('metrics_csv_missing', []).append(str(p_path))
+							continue
+					# read CSV and convert to frame-keyed mapping
+					with p_path.open('r', encoding='utf-8') as cf:
+						reader = _csv.DictReader(cf)
+						rows = list(reader)
+						if not rows:
+							m.setdefault('metrics_csv_empty', []).append(str(p_path))
+							continue
+						# If there's a 'frame' column, use it; otherwise index by row number
+						frame_keyed = {}
+						for idx, row in enumerate(rows):
+							# parse values
+							parsed = {k: _parse_val(v) for k, v in row.items()}
+							if 'frame' in parsed and parsed.get('frame') is not None:
+								frm = int(parsed.get('frame'))
+								# drop the frame key inside the frame dict
+								d = {kk: vv for kk, vv in parsed.items() if kk != 'frame'}
+								frame_keyed[str(frm)] = d
+							else:
+								frame_keyed[str(idx)] = parsed
+						# attach under module result
+						metrics_expanded[str(p_path.name)] = frame_keyed
+				# if we expanded anything, attach to module's dict
+				if metrics_expanded:
+					m['metrics_data'] = metrics_expanded
+			except Exception:
+				m.setdefault('metrics_expand_error', _tb.format_exc())
+	except Exception:
+		# non-fatal; record top-level error
+		out['metrics_expand_error'] = _tb.format_exc()
+
 	# Save combined metrics JSON (one file per job)
 	try:
 		metrics_path = dest_dir / f"{job_id}_metric_result.json"

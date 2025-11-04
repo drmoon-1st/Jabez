@@ -82,7 +82,8 @@ async def skeleton_metric_predict(req: OpenPoseRequest, background_tasks: Backgr
         # pass dimension and job_id so controller can handle 2d(mp4) vs 3d(zip) and name result as <job_id>.json
         background_tasks.add_task(process_and_save, req.s3_key, dimension, job_id, turbo_without_skeleton, dest_dir)
         # schedule upload of result.json and overlay videos to result S3 bucket after processing
-        background_tasks.add_task(upload_result_to_s3, dest_dir, job_id, s3_key)
+        # background_tasks.add_task(upload_result_to_s3, dest_dir, job_id, s3_key)
+        # s3 업로드는 비용으로 인해 잠시 중지
 
         # return an immediate accepted response with job info
         return JSONResponse(status_code=202, content={

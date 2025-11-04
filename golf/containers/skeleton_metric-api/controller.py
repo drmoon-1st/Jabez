@@ -577,10 +577,37 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             pass
 
         # Optionally run local metrics using the in-memory DataFrames; run_metrics_in_process will write CSVs into dest_dir
+        metrics_res = None
         try:
-            run_metrics_in_process(dimension, locals())
+            metrics_res = run_metrics_in_process(dimension, locals())
         except Exception:
             # metrics failures shouldn't take down processing
+            traceback.print_exc()
+
+        # If the metric runner produced structured output, merge it into the job result JSON
+        try:
+            if isinstance(metrics_res, dict):
+                # Add a top-level 'metrics' key containing per-module results (prefer metrics_res['metrics'] if present)
+                metrics_payload = metrics_res.get('metrics') if 'metrics' in metrics_res else metrics_res
+                response_payload['metrics'] = metrics_payload
+                # include path to the saved metrics JSON when available
+                if 'metrics_path' in metrics_res:
+                    response_payload['metrics_path'] = metrics_res.get('metrics_path')
+                else:
+                    # fallback: check dest_dir for conventional filename
+                    metrics_path_candidate = Path(dest_dir) / f"{job_id}_metric_result.json"
+                    if metrics_path_candidate.exists():
+                        response_payload['metrics_path'] = str(metrics_path_candidate)
+
+                # overwrite the job json on disk with enriched payload so upload picks it up
+                try:
+                    out_path = Path(dest_dir) / f"{job_id}.json"
+                    with out_path.open('w', encoding='utf-8') as f:
+                        json.dump(response_payload, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    # non-fatal; we still return the response_payload in memory
+                    traceback.print_exc()
+        except Exception:
             traceback.print_exc()
 
         # If metrics did not create an overlay mp4, create a minimal overlay from copied images
@@ -676,6 +703,16 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
             json_key = f"results/{job_id}.json"
         s3.upload_file(str(local_json), bucket, json_key)
         uploaded.append({'local': str(local_json), 'bucket': bucket, 'key': json_key})
+
+        # upload combined metrics JSON if produced by metric runner
+        metrics_json_local = Path(dest_dir) / f"{job_id}_metric_result.json"
+        if metrics_json_local.exists():
+            if prefix:
+                mkey = f"{prefix}/{metrics_json_local.name}"
+            else:
+                mkey = f"results/{metrics_json_local.name}"
+            s3.upload_file(str(metrics_json_local), bucket, mkey)
+            uploaded.append({'local': str(metrics_json_local), 'bucket': bucket, 'key': mkey})
 
         # upload any overlay mp4 files found in dest_dir
         # overlay filenames convention: either '{job_id}*.mp4' or '*.mp4' in dest_dir
