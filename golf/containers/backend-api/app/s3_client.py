@@ -20,6 +20,8 @@ class S3Client:
             signature_version="s3v4",
             s3={"addressing_style": "virtual"}
         )
+        # aws access key로 s3 presigned url 생성에 접근
+        # 관리 잘못하면 보안 이슈가 될 수 있으니 주의(s3 과금 어마어마할 것)
         self._client = boto3.client(
             "s3",
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -28,6 +30,7 @@ class S3Client:
             config=config,
         )
 
+    # s3 presigned URL 생성 메서드
     def create_presigned_url(self, object_key: str, file_type: str, file_size: int) -> str:
         """
         PUT 용 presigned URL 반환.

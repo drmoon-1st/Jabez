@@ -1,5 +1,5 @@
-# visualize_3d_skeleton_from_csv.py
-# 사용법: python visualize_3d_skeleton_from_csv.py
+# visualize_skeleton3d_plotly_csv.py
+# 사용법: python visualize_skeleton3d_plotly_csv.py
 # 필요: pip install pandas matplotlib
 
 import os
@@ -9,7 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 
-CSV_PATH = os.path.join("output", "skeleton2d3d.csv")
+CSV_PATH = os.path.join("output", "swing_20251002_150237", "skeleton3d.csv")
 
 # COCO17 관절 이름(CSV 3D 컬럼 접두어와 일치)
 COCO17 = [

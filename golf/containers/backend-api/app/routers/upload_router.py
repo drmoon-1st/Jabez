@@ -32,7 +32,7 @@ s3_client = S3Client()
 # 클라이언트로부터 받을 요청 본문 구조
 class UploadStartPayload(BaseModel):
     # DB 스키마와 매핑되는 필수 정보
-    upload_source: str = Field(..., description="업로드 경로: WEB_2D 또는 EXE_3D")
+    upload_source: str = Field(..., description="업로드 경로: 2D 또는 3D")
     original_filename: str
     file_type: str
     file_size_bytes: int
@@ -48,9 +48,9 @@ def create_s3_key(user_id: Optional[str], non_member_id: Optional[str], source: 
     
     # 파일 확장자 추출 (MIME 타입에서)
     ext = file_type.split('/')[-1] if '/' in file_type else file_type.lower()
-    if ext == 'zip' and source == 'EXE_3D':
+    if ext == 'zip' and source == '3D':
         ext = 'zip'
-    elif ext == 'mp4' and source == 'WEB_2D':
+    elif ext == 'mp4' and source == '2D':
         ext = 'mp4'
     else:
         ext = 'dat' # 기본값

@@ -1,6 +1,6 @@
 opencv-python
 pyyaml
-pyrealsense2
-mediapipe
+# pyrealsense2 removed
+# mediapipe removed
 pandas
 numpy
