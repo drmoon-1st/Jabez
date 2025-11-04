@@ -698,6 +698,12 @@ def run_from_context(ctx: dict):
         fps = int(ctx.get('fps', 30))
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
+        # If wide2 is missing but wide3 is present (3D pipeline), allow using wide3 as fallback
+        if wide2 is None and wide3 is not None:
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
         img_dir = Path(ctx.get('img_dir', dest))
         codec = str(ctx.get('codec', 'mp4v'))
         ensure_dir(dest)

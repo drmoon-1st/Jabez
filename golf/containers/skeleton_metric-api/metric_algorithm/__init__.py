@@ -93,6 +93,29 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 			except Exception:
 				out['metrics']['metrics_csv_write_error'] = _tb.format_exc()
 
+		# For 2D runs many metric modules expect a single overlay CSV as their input.
+		# Make the overlay_csv also available as `metrics_csv` for 2D so downstream
+		# expansion logic can inline per-frame data even if modules don't return their own CSV paths.
+		if str(dimension).lower() == '2d':
+			# if metrics_csv wasn't written, point it to overlay_csv for expansion
+			try:
+				if not metrics_csv.exists():
+					# copy overlay_csv to metrics_csv path for consistency
+					if overlay_csv.exists():
+						try:
+							import shutil as _sh
+							_sh.copy2(str(overlay_csv), str(metrics_csv))
+						except Exception:
+							# if copy fails, attempt to create a tiny symlink-like file by writing header
+							try:
+								with metrics_csv.open('w', encoding='utf-8') as mf:
+									mf.write(overlay_csv.read_text(encoding='utf-8'))
+							except Exception:
+								pass
+			except Exception:
+				# non-fatal
+				pass
+
 		# build an absolute-path config that metric CLIs will accept
 		cfg_obj = {
 			"overlay_csv_path": str(overlay_csv),
@@ -122,7 +145,8 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		'wide3': wide3,
 		'overlay_csv': str(overlay_csv) if 'overlay_csv' in locals() else None,
 		'metrics_csv': str(metrics_csv) if 'metrics_csv' in locals() else None,
-		'img_dir': str(dest_dir),
+		# point img_dir to dest/img where controller copies OpenPose-rendered images
+		'img_dir': str((dest_dir / 'img').resolve()),
 		'overlay_mp4_template': str(dest_dir / f"{job_id}_{{metric}}_overlay.mp4"),
 		'job_id': job_id,
 		'dest_dir': str(dest_dir),
@@ -132,10 +156,50 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 	# Run each metric module's standardized runner if present
 	for name, mod in METRIC_MODULES.items():
 		try:
+			# Skip xfactor for pure 2D runs: xfactor needs 3D metrics for correct results
+			if name == 'xfactor' and str(dimension).lower() == '2d':
+				out['metrics'][name] = {'skipped': True, 'reason': 'xfactor requires 3D metrics; skipped for 2D run'}
+				continue
 			if hasattr(mod, 'run_from_context') and callable(getattr(mod, 'run_from_context')):
 				try:
 					res = mod.run_from_context(module_ctx)
+					# If this is a 2D run, ensure modules have a metrics_csv to allow frame_data expansion.
+					if isinstance(res, dict) and str(dimension).lower() == '2d':
+						try:
+							# if module didn't provide any csv-like keys or provided them as null/None,
+							# attach the generated metrics_csv path so the expansion step can read per-frame values.
+							has_csv_key = any(('csv' in k.lower() and res.get(k)) for k in res.keys())
+							if not has_csv_key and metrics_csv.exists():
+								res['metrics_csv'] = str(metrics_csv)
+						except Exception:
+							pass
 					# expect res to be JSON-serializable (dict/list/primitive)
+					# Normalize overlay paths: if module returned overlay_mp4, ensure file is moved into dest_dir/mp4
+					if isinstance(res, dict) and res.get('overlay_mp4'):
+						try:
+							ov = res.get('overlay_mp4')
+							ovp = _Path(ov)
+							mp4_dir = dest_dir / 'mp4'
+							mp4_dir.mkdir(parents=True, exist_ok=True)
+							if ovp.exists():
+								try:
+									# prefer atomic move
+									ovp.replace(mp4_dir / ovp.name)
+								except Exception:
+									import shutil as _sh
+									try:
+										_sh.move(str(ovp), str(mp4_dir / ovp.name))
+									except Exception:
+										try:
+											_sh.copy2(str(ovp), str(mp4_dir / ovp.name))
+										except Exception:
+											# give up copying
+											pass
+							# update returned path to be relative into mp4/
+							res['overlay_mp4'] = str(_Path('mp4') / (mp4_dir / ovp.name).name)
+						except Exception:
+							# non-fatal normalization failure
+							pass
 					out['metrics'][name] = res
 				except Exception:
 					out['metrics'][name] = {'error': _tb.format_exc()}
@@ -179,9 +243,12 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		out['overlay_upload_error'] = _tb.format_exc()
 
 	# Expand any metrics CSVs produced by modules into JSON structures so the
-	# combined metrics JSON contains frame-wise data inline (helps downstream clients)
+	# combined metrics JSON contains frame-wise data inline (helps downstream clients).
+	# Convert CSVs into a single `frame_data` dict per module (frame -> {col: val}).
 	try:
 		import csv as _csv
+		import pandas as _pd
+
 		def _parse_val(s):
 			# attempt to coerce to int/float, otherwise leave as string
 			if s is None:
@@ -194,7 +261,7 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 					f = float(s)
 					return int(f) if f.is_integer() else f
 			except Exception:
-				a = None
+				pass
 			try:
 				return int(s)
 			except Exception:
@@ -204,52 +271,92 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 			try:
 				if not isinstance(m, dict):
 					continue
-				# support single metrics_csv path
+
+				# Collect candidate CSV paths reported by module
 				csv_paths = []
-				if 'metrics_csv' in m and m.get('metrics_csv'):
-					csv_paths.append(m.get('metrics_csv'))
-				# support plural key
-				if 'metrics_csvs' in m and isinstance(m.get('metrics_csvs'), (list, tuple)):
-					csv_paths.extend(list(m.get('metrics_csvs')))
-				# if module returned a different key name (e.g., 'metrics'), try to detect csv-like values
-				# process each candidate
-				metrics_expanded = {}
+				# common keys that modules might set
+				for key in ('metrics_csv', 'metrics_csv_path', 'metrics_csvs', 'metrics'):
+					if key in m and m.get(key):
+						val = m.get(key)
+						if isinstance(val, (list, tuple)):
+							csv_paths.extend(val)
+						else:
+							csv_paths.append(val)
+
+				# Normalize paths and attempt to read them into dataframes
+				dfs = []
 				for p in csv_paths:
 					if not p:
 						continue
 					p_path = _Path(p)
 					if not p_path.exists():
 						# try relative to dest_dir
-						cand = _Path(out.get('metrics_path') or _Path(dest_dir) / f"{job_id}_metric_result.json").parent / p_path.name
+						cand = _Path(m.get('metrics_path') or _Path(dest_dir) / f"{job_id}_metric_result.json").parent / p_path.name
 						if cand.exists():
 							p_path = cand
 						else:
-							m.setdefault('metrics_csv_missing', []).append(str(p_path))
+							# skip missing
 							continue
-					# read CSV and convert to frame-keyed mapping
-					with p_path.open('r', encoding='utf-8') as cf:
-						reader = _csv.DictReader(cf)
-						rows = list(reader)
-						if not rows:
-							m.setdefault('metrics_csv_empty', []).append(str(p_path))
+					try:
+						df = _pd.read_csv(p_path)
+						dfs.append(df)
+					except Exception:
+						# try csv module fallback
+						try:
+							with p_path.open('r', encoding='utf-8') as cf:
+								rdr = _csv.DictReader(cf)
+								rows = list(rdr)
+							if rows:
+								df = _pd.DataFrame(rows)
+								dfs.append(df)
+						except Exception:
 							continue
-						# If there's a 'frame' column, use it; otherwise index by row number
-						frame_keyed = {}
-						for idx, row in enumerate(rows):
-							# parse values
-							parsed = {k: _parse_val(v) for k, v in row.items()}
-							if 'frame' in parsed and parsed.get('frame') is not None:
-								frm = int(parsed.get('frame'))
-								# drop the frame key inside the frame dict
-								d = {kk: vv for kk, vv in parsed.items() if kk != 'frame'}
-								frame_keyed[str(frm)] = d
-							else:
-								frame_keyed[str(idx)] = parsed
-						# attach under module result
-						metrics_expanded[str(p_path.name)] = frame_keyed
-				# if we expanded anything, attach to module's dict
-				if metrics_expanded:
-					m['metrics_data'] = metrics_expanded
+
+				if not dfs:
+					continue
+
+				# Merge dataframes on 'frame' if present, else by index
+				for i, df in enumerate(dfs):
+					if 'frame' in df.columns:
+						dfs[i] = df.set_index('frame')
+					else:
+						df.index.name = 'frame'
+
+				from functools import reduce
+				def _join(a, b):
+					return a.join(b, how='outer', lsuffix='_l', rsuffix='_r')
+
+				merged = reduce(_join, dfs) if len(dfs) > 1 else dfs[0]
+
+				# Build frame_data: map frame index -> dict of columns (None for NaN)
+				frame_data = {}
+				for idx, row in merged.iterrows():
+					try:
+						fkey = int(idx)
+					except Exception:
+						fkey = str(idx)
+					rd = {}
+					for col, val in row.items():
+						if _pd.isna(val):
+							rd[col] = None
+						else:
+							# convert numpy scalar to python type when possible
+							try:
+								if hasattr(val, 'item'):
+									val = val.item()
+							except Exception:
+								pass
+							rd[col] = val
+					frame_data[str(fkey)] = rd
+
+				# attach frame_data and remove csv path keys from module result
+				m['frame_data'] = frame_data
+				for k in ('metrics_csv', 'metrics_csvs', 'metrics_csv_path', 'metrics'):
+					if k in m:
+						try:
+							del m[k]
+						except Exception:
+							pass
 			except Exception:
 				m.setdefault('metrics_expand_error', _tb.format_exc())
 	except Exception:
@@ -258,6 +365,10 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 
 	# Save combined metrics JSON (one file per job)
 	try:
+		# remove injected_* debug/config paths before saving final JSON
+		for k in list(out.keys()):
+			if str(k).startswith('injected_'):
+				del out[k]
 		metrics_path = dest_dir / f"{job_id}_metric_result.json"
 		metrics_path.write_text(_json.dumps(out, indent=2), encoding='utf-8')
 		out['metrics_path'] = str(metrics_path)

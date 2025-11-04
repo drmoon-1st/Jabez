@@ -900,6 +900,12 @@ def run_from_context(ctx: dict):
         fps = int(ctx.get('fps', 30))
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
+        # If no wide2 is provided but wide3 exists (3D pipeline), allow using wide3
+        if wide2 is None and wide3 is not None:
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
         ensure_dir(dest)
 
         out = {}

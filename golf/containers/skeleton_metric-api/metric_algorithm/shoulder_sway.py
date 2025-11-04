@@ -286,25 +286,78 @@ if __name__ == '__main__':
 
 
 def run_from_context(ctx: dict):
-    """Standardized runner for shoulder_sway. Produces overlay mp4 only."""
+    """Standardized runner for shoulder_sway. Produces overlay mp4 only.
+
+    Returns a dict with a single key 'overlay_mp4' whose value is a string path
+    to the mp4 file or None when not available. On unexpected exceptions the
+    function returns {'error': '<message>'}.
+    """
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = ctx.get('job_id', 'job')
         fps = int(ctx.get('fps', 30))
         wide2 = ctx.get('wide2')
+
+        # If running in 3D mode, a wide3 DataFrame may be available but wide2 is not.
+        # Use wide3 as a fallback (overlay_sway can accept several column name schemes).
+        if wide2 is None and ctx.get('wide3') is not None:
+            wide2 = ctx.get('wide3')
+
         ensure_dir(dest)
-        out = {}
         overlay_path = dest / f"{job_id}_shoulder_sway_overlay.mp4"
+
+        # If wide2 not provided in ctx, try to load overlay CSV path if available
+        if wide2 is None:
+            try:
+                overlay_csv = ctx.get('overlay_csv') or ctx.get('overlay_csv_path') or ctx.get('overlay_csvs')
+                if isinstance(overlay_csv, (list, tuple)):
+                    overlay_csv = overlay_csv[0] if overlay_csv else None
+                if overlay_csv:
+                    ocp = Path(overlay_csv)
+                    if not ocp.exists():
+                        # try relative to dest
+                        cand = Path(ctx.get('dest_dir', dest)) / Path(overlay_csv).name
+                        if cand.exists():
+                            ocp = cand
+                    if ocp.exists():
+                        try:
+                            import pandas as _pd
+                            wide2 = _pd.read_csv(ocp)
+                        except Exception:
+                            # keep wide2 as None if reading fails
+                            wide2 = None
+            except Exception:
+                # don't leak internal overlay lookup failures in return shape
+                wide2 = None
+
+        # If we have 2D overlay data, try to render
         if wide2 is not None:
             try:
                 img_dir = Path(ctx.get('img_dir', dest))
                 lm = ctx.get('landmarks', {}) or {}
                 overlay_sway(img_dir, wide2, overlay_path, fps, 'mp4v', lm)
-                out['overlay_mp4'] = str(overlay_path)
-            except Exception as e:
-                out.setdefault('overlay_error', str(e))
-        else:
-            out['overlay_mp4'] = None
-        return out
+                return {'overlay_mp4': str(overlay_path)}
+            except Exception:
+                # fall through to trying to find existing rendered files
+                pass
+
+        # No 2D overlay CSV available or rendering failed; try to find any pre-rendered overlay files in dest
+        candidates = []
+        try:
+            candidates.extend(list(dest.glob(f"{job_id}*shoulder*.mp4")))
+            candidates.extend(list(dest.glob(f"*shoulder*.mp4")))
+            cand_cli = dest / 'shoulder_sway_analysis.mp4'
+            if cand_cli.exists():
+                candidates.append(cand_cli)
+        except Exception:
+            pass
+
+        if candidates:
+            candidates = sorted(candidates, key=lambda p: (0 if p.name.startswith(job_id) else 1, p.name))
+            chosen = candidates[0]
+            return {'overlay_mp4': str(chosen)}
+
+        return {'overlay_mp4': None}
+
     except Exception as e:
         return {'error': str(e)}

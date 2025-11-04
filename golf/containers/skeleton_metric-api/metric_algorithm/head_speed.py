@@ -775,6 +775,13 @@ def run_from_context(ctx: dict):
         fps = int(ctx.get('fps', 30))
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
+        # If wide2 is missing (no 2D CSV), but wide3 exists (3D run), use wide3 as a fallback
+        # Overlay drawing utilities are flexible in column names and can often use X/Y from wide3.
+        if wide2 is None and wide3 is not None:
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
         img_dir = Path(ctx.get('img_dir', dest))
         codec = str(ctx.get('codec', 'mp4v'))
         ensure_dir(dest)

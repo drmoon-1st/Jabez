@@ -289,5 +289,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-# 입력 명령어 예시
-# python skeleton_metric-client.py --s3-key c4282d5c-5091-7071-aa3d-6f5d97e2fd8e/3d/d70b7ead-4e14-48f5-a92c-11698399ca3b.zip --dimension 3d --api-url http://localhost:19030/skeleton_metric_predict

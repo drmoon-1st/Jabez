@@ -135,6 +135,81 @@ def upload_overlay_to_s3(local_path: str, job_id: str, metric: str, bucket_envs=
     return {'bucket': bucket, 'key': key}
 
 
+def images_to_mp4(img_paths, out_mp4: str, fps: float = 30.0, resize: tuple = None, filter_rendered: bool = True, write_debug: bool = True):
+    """Create an mp4 from a list of image paths.
+
+    - img_paths: iterable of Path or str
+    - out_mp4: destination mp4 path (string)
+    - fps: frames per second
+    - resize: (w,h) tuple to force resize, or None to use first image size
+    - filter_rendered: if True skip files with 'render' or 'openpose' in the name
+    - write_debug: if True, write a small JSON next to out_mp4 with source info
+    Returns: (created: bool, used_count: int)
+    """
+    try:
+        from pathlib import Path as _Path
+        import cv2 as _cv2
+        import json as _json
+        paths = []
+        for p in img_paths:
+            pp = _Path(p)
+            name = pp.name.lower()
+            if filter_rendered and ('render' in name or 'openpose' in name):
+                continue
+            if not pp.exists():
+                continue
+            paths.append(pp)
+        # dedupe by name preserving order
+        seen = set()
+        uniq = []
+        for p in paths:
+            if p.name in seen:
+                continue
+            seen.add(p.name)
+            uniq.append(p)
+        paths = uniq
+
+        if not paths:
+            return False, 0
+
+        # determine size
+        w, h = None, None
+        if resize is not None:
+            w, h = resize
+        else:
+            for p in paths:
+                im = _cv2.imread(str(p))
+                if im is None:
+                    continue
+                h, w = im.shape[:2]
+                break
+        if w is None or h is None:
+            return False, 0
+
+        fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
+        vw = _cv2.VideoWriter(str(out_mp4), fourcc, float(fps), (w, h))
+        used = 0
+        for p in paths:
+            im = _cv2.imread(str(p))
+            if im is None:
+                continue
+            if im.shape[1] != w or im.shape[0] != h:
+                im = _cv2.resize(im, (w, h))
+            vw.write(im)
+            used += 1
+        vw.release()
+
+        if write_debug:
+            try:
+                dbg = {'images_used': used, 'total_candidates': len(paths)}
+                _Path(out_mp4).with_suffix('.debug.json').write_text(_json.dumps(dbg, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+        return True, used
+    except Exception:
+        return False, 0
+
+
 # ---------------------------------------------------------------------------
 # Example template for run_from_context (copy into metric modules):
 #
