@@ -68,33 +68,9 @@ def get_xyz_cols(df: pd.DataFrame, name: str):
 
 def get_xyc_row(row: pd.Series, name: str):
     cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x_raw = row.get(cols_map.get(name, {}).get('x', ''), np.nan)
-    y_raw = row.get(cols_map.get(name, {}).get('y', ''), np.nan)
-    # try to find confidence column variants
-    c_raw = None
-    for c_name in (f"{name}__c", f"{name}_c", f"{name}_C", f"{name}_conf"):
-        if c_name in row.index:
-            c_raw = row.get(c_name)
-            break
-
-    def to_float(v):
-        try:
-            return float(v)
-        except Exception:
-            return float('nan')
-
-    x = to_float(x_raw)
-    y = to_float(y_raw)
-    c = to_float(c_raw) if c_raw is not None else float('nan')
-
-    # Treat sentinel (0.0,0.0) with missing/zero confidence as absent
-    if (not np.isnan(x) and not np.isnan(y)) and x == 0.0 and y == 0.0 and (np.isnan(c) or c == 0.0):
-        return float('nan'), float('nan'), 0.0
-
-    # default confidence to 1.0 when missing
-    if np.isnan(c):
-        c = 1.0
-    return x, y, c
+    x = row.get(cols_map.get(name, {}).get('x',''), np.nan)
+    y = row.get(cols_map.get(name, {}).get('y',''), np.nan)
+    return x, y, 1.0
 
 # =========================================================
 # 2D 스무딩 유틸들 (점프 제한 없는 필터들)
