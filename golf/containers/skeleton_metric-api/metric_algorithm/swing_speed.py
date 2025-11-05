@@ -68,9 +68,32 @@ def get_xyz_cols(df: pd.DataFrame, name: str):
 
 def get_xyc_row(row: pd.Series, name: str):
     cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x = row.get(cols_map.get(name, {}).get('x',''), np.nan)
-    y = row.get(cols_map.get(name, {}).get('y',''), np.nan)
-    return x, y, 1.0
+    x_raw = row.get(cols_map.get(name, {}).get('x', ''), np.nan)
+    y_raw = row.get(cols_map.get(name, {}).get('y', ''), np.nan)
+    # optional confidence columns
+    c_raw = None
+    for c_name in (f"{name}__c", f"{name}_c", f"{name}_C", f"{name}_conf"):
+        if c_name in row.index:
+            c_raw = row.get(c_name)
+            break
+
+    def to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return float('nan')
+
+    x = to_float(x_raw)
+    y = to_float(y_raw)
+    c = to_float(c_raw) if c_raw is not None else float('nan')
+
+    # Treat sentinel (0,0) with missing or zero confidence as absent
+    if (not np.isnan(x) and not np.isnan(y)) and x == 0.0 and y == 0.0 and (np.isnan(c) or c == 0.0):
+        return float('nan'), float('nan'), 0.0
+
+    if np.isnan(c):
+        c = 1.0
+    return x, y, c
 
 # =========================================================
 # 2D 스무딩 유틸들 (점프 제한 없는 필터들)
@@ -83,6 +106,30 @@ def _interpolate_series(s: pd.Series) -> pd.Series:
     s2 = s2.interpolate(method='linear', limit_direction='both')
     s2 = s2.fillna(method='ffill').fillna(method='bfill')
     return s2
+
+
+def suppress_jumps(arr, k: float = 5.0):
+    """
+    Suppress momentary large jumps in a 1D coordinate sequence using MAD-based thresholding.
+    Replaces values that jump beyond median+ k*MAD by a limited increment from previous value.
+    """
+    arr = np.asarray(arr, dtype=float)
+    out = arr.copy()
+    if len(arr) <= 1:
+        return out
+
+    deltas = np.diff(arr, prepend=arr[0])
+    abs_deltas = np.abs(deltas)
+
+    med = np.median(abs_deltas)
+    mad = np.median(np.abs(abs_deltas - med))
+    thresh = med + k * 1.4826 * mad
+
+    for i in range(1, len(arr)):
+        if abs_deltas[i] > thresh:
+            # limit the step to threshold in the same sign direction
+            out[i] = out[i-1] + np.sign(deltas[i]) * thresh
+    return out
 
 def _ema(arr: np.ndarray, alpha: float) -> np.ndarray:
     y = np.empty_like(arr, dtype=float)
@@ -185,6 +232,8 @@ def smooth_df_2d(
             s = out[col].astype(float)
             s_interp = _interpolate_series(s)
             arr = s_interp.to_numpy()
+            # suppress single-frame spikes before smoothing
+            arr = suppress_jumps(arr, k=5.0)
             if method == 'ema':
                 y = _ema(arr, alpha)
             elif method == 'moving':
