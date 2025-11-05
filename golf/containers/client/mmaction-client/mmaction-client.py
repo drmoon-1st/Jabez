@@ -6,8 +6,8 @@ import base64
 
 # --- 설정 ---
 # API 서버의 URL (호스트 포트 19031을 사용)
-# API_URL = "http://localhost:19031/mmaction_stgcn_test"
-API_URL = "https://j0ixr5rvft4ccm-19031.proxy.runpod.net/mmaction_stgcn_test"
+API_URL = "http://localhost:19031/mmaction_stgcn_test"
+# API_URL = "https://j0ixr5rvft4ccm-19031.proxy.runpod.net/mmaction_stgcn_test"
 # 실제 키포인트 데이터 파일 경로
 TEMP_INPUT_CSV = "skeleton2d.csv"
 # ----------------
