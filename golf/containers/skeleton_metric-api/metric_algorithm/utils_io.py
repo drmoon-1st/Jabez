@@ -24,6 +24,9 @@ COCO_KP17 = [
     "LKnee", "RKnee", "LAnkle", "RAnkle"
 ]
 
+# Mapping from OpenPose COCO-18 indices -> COCO-17 ordering (used when input has 18 kps)
+_IDX_MAP_18_TO_17 = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
+
 
 def tidy_to_wide(df_tidy, dimension: str = '2d', person_idx: int = 0):
     """Convert tidy skeleton DataFrame to wide per-frame DataFrame.
@@ -54,26 +57,58 @@ def tidy_to_wide(df_tidy, dimension: str = '2d', person_idx: int = 0):
 
     frames = sorted(df_person['frame'].unique())
     rows = []
+    # detect if incoming joint_idx values appear to be OpenPose-18 indexed
+    incoming_max_idx = int(df_person['joint_idx'].max()) if len(df_person) > 0 else -1
+    use_op18_map = incoming_max_idx >= 17  # indices 0..17 suggest OpenPose-18 ordering
+    if use_op18_map:
+        # build reverse mapping: op18_index -> kp17_name
+        op18_to_kp17_name = {op_idx: COCO_KP17[kp_idx] for kp_idx, op_idx in enumerate(_IDX_MAP_18_TO_17)}
+    else:
+        op18_to_kp17_name = {}
     for fr in frames:
         row = {'frame': int(fr)}
         sub = df_person[df_person['frame'] == fr]
         for _, r in sub.iterrows():
             j = int(r['joint_idx'])
-            name = COCO_KP17[j] if j >=0 and j < len(COCO_KP17) else f'J{j}'
+            if use_op18_map and j in op18_to_kp17_name:
+                name = op18_to_kp17_name[j]
+            else:
+                name = COCO_KP17[j] if 0 <= j < len(COCO_KP17) else f'J{j}'
             if dimension == '2d':
-                row[f"{name}__x"] = float(r.get('x', float('nan')))
-                row[f"{name}__y"] = float(r.get('y', float('nan')))
+                xval = float(r.get('x', float('nan')))
+                yval = float(r.get('y', float('nan')))
                 # confidence may be 'conf' or 'c'
                 conf = r.get('conf', r.get('c', None))
-                row[f"{name}__c"] = float(conf) if conf is not None else float('nan')
+                cval = float(conf) if conf is not None else float('nan')
+                # canonical names (double-underscore)
+                row[f"{name}__x"] = xval
+                row[f"{name}__y"] = yval
+                row[f"{name}__c"] = cval
+                # single-underscore aliases (common variants)
+                row[f"{name}_x"] = xval
+                row[f"{name}_y"] = yval
+                # uppercase axis aliases
+                row[f"{name}_X"] = xval
+                row[f"{name}_Y"] = yval
             else:
                 # 3D: prefer X,Y,Z (capital) from tidy if present, else map from x,y plus depth Z
                 X = r.get('X', r.get('x', float('nan')))
                 Y = r.get('Y', r.get('y', float('nan')))
                 Z = r.get('Z', r.get('z', float('nan')))
-                row[f"{name}__x"] = float(X) if X is not None else float('nan')
-                row[f"{name}__y"] = float(Y) if Y is not None else float('nan')
-                row[f"{name}__z"] = float(Z) if Z is not None else float('nan')
+                xval = float(X) if X is not None else float('nan')
+                yval = float(Y) if Y is not None else float('nan')
+                zval = float(Z) if Z is not None else float('nan')
+                # canonical names
+                row[f"{name}__x"] = xval
+                row[f"{name}__y"] = yval
+                row[f"{name}__z"] = zval
+                # variants used by different modules
+                row[f"{name}_X3D"] = xval
+                row[f"{name}_Y3D"] = yval
+                row[f"{name}_Z3D"] = zval
+                row[f"{name}_X"] = xval
+                row[f"{name}_Y"] = yval
+                row[f"{name}_Z"] = zval
         rows.append(row)
 
     wide = _pd.DataFrame(rows)
