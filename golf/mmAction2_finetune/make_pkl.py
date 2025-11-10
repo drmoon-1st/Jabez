@@ -25,6 +25,7 @@ import argparse
 import pickle
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 import random
 import sys
 
@@ -37,39 +38,108 @@ def csv_to_annotation(csv_path: Path, frame_dir: str, label: int, img_shape=(108
     [x1,y1,c1, x2,y2,c2, ...]. We extract (x,y) for each keypoint and form a
     (T, V, 2) array (T frames, V keypoints).
     """
-    df = pd.read_csv(csv_path, header=None)
-    if df.size == 0:
+    # Try to detect COCO-style columnar CSVs (with columns like 'Nose_x',
+    # 'Nose_y', 'Nose_c'). If detected, parse into a (T, V, 2) array using
+    # the column layout. Otherwise, fall back to the legacy per-row flat
+    # array format handling.
+    try:
+        df_try = pd.read_csv(csv_path, encoding='utf-8-sig')
+        cols = [c.strip().replace('\ufeff', '') for c in df_try.columns]
+        COCO_NAMES = [
+            'Nose','LEye','REye','LEar','REar','LShoulder','RShoulder','LElbow','RElbow',
+            'LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle'
+        ]
+        expected_cols = []
+        for n in COCO_NAMES:
+            for s in ['_x', '_y', '_c']:
+                expected_cols.append(f"{n}{s}")
+
+        if all(ec in cols for ec in expected_cols):
+            # Columnar COCO-style CSV detected.
+            df = df_try.copy()
+            df.columns = cols
+            arr = np.stack([
+                df[[f"{name}_x" for name in COCO_NAMES]].values,
+                df[[f"{name}_y" for name in COCO_NAMES]].values,
+                df[[f"{name}_c" for name in COCO_NAMES]].values
+            ], axis=2)
+            # arr shape: (T, V, 3) -> we need (T, V, 2)
+            keypoint_arr = arr[:, :, :2]
+            frames = [row.tolist() for row in keypoint_arr]
+        else:
+            # fallback to legacy row-based parsing
+            df = pd.read_csv(csv_path, header=None)
+            if df.size == 0:
+                return None
+
+            frames = []
+            for _, row in df.iterrows():
+                vals = row.dropna()
+                if vals.empty:
+                    continue
+                vals_num = pd.to_numeric(vals, errors='coerce').dropna()
+                if vals_num.size == 0:
+                    continue
+                arr = np.array(vals_num, dtype=float)
+
+                if arr.size % 3 != 0:
+                    if arr.size % 2 == 0:
+                        pts = arr.reshape(-1, 2)
+                    else:
+                        pts = np.zeros((25, 2), dtype=float)
+                else:
+                    pts3 = arr.reshape(-1, 3)
+                    pts = pts3[:, :2]
+
+                frames.append(pts.tolist())
+    except Exception:
+        # if CSV reading fails for any reason, try the legacy path
+        df = pd.read_csv(csv_path, header=None)
+        if df.size == 0:
+            return None
+        frames = []
+        for _, row in df.iterrows():
+            vals = row.dropna()
+            if vals.empty:
+                continue
+            vals_num = pd.to_numeric(vals, errors='coerce').dropna()
+            if vals_num.size == 0:
+                continue
+            arr = np.array(vals_num, dtype=float)
+
+            if arr.size % 3 != 0:
+                if arr.size % 2 == 0:
+                    pts = arr.reshape(-1, 2)
+                else:
+                    pts = np.zeros((25, 2), dtype=float)
+            else:
+                pts3 = arr.reshape(-1, 3)
+                pts = pts3[:, :2]
+
+            frames.append(pts.tolist())
+
+        # (removed stray per-file normalization/append which duplicated last frame)
+
+    if len(frames) == 0:
         return None
 
-    frames = []
-    for _, row in df.iterrows():
-        arr = np.array(row.dropna(), dtype=float)
-        if arr.size % 3 != 0:
-            # try to handle rows saved as only x,y pairs
-            if arr.size % 2 == 0:
-                pts = arr.reshape(-1, 2)
-            else:
-                # unexpected format
-                pts = np.zeros((25, 2), dtype=float)
-        else:
-            pts3 = arr.reshape(-1, 3)
-            pts = pts3[:, :2]
-
-        # optional normalization
-        if normalize_method == '0to1':
-            h, w = img_shape
-            pts = pts.copy()
-            pts[:, 0] = pts[:, 0] / float(w)
-            pts[:, 1] = pts[:, 1] / float(h)
-
-        frames.append(pts.tolist())
-
     keypoint = np.stack([np.array(f) for f in frames], axis=0)  # (T, V, 2)
+
+    # optional normalization applied on the whole array
+    if normalize_method == '0to1':
+        h, w = img_shape
+        kp = keypoint.copy()
+        kp[..., 0] = kp[..., 0] / float(w)
+        kp[..., 1] = kp[..., 1] / float(h)
+        keypoint = kp
+
+    # use float32 arrays so downstream tooling can index with ellipsis
+    keypoint = keypoint.astype(np.float32)
 
     ann = {
         'frame_dir': frame_dir,
         'label': int(label),
-        'keypoint': keypoint.tolist(),
+        'keypoint': keypoint,
         'img_shape': tuple(img_shape)
     }
     return ann
@@ -98,15 +168,87 @@ def detect_label_from_path(p: Path):
 def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
                      normalize_method='0to1', val_ratio: float = 0.0, seed: int = 42):
     csv_root = Path(csv_root)
-    all_csvs = sorted([p for p in csv_root.rglob('*.csv')])
-    print(f"Found {len(all_csvs)} CSV files under {csv_root}")
+    # Instead of scanning the entire tree, only look under the expected
+    # evaluation folders (true/false) and the five labels under them. For
+    # each of those label folders, look specifically in the `skeleton_crop`
+    # subfolder which is expected to contain only the skeleton CSVs. This
+    # avoids walking through many irrelevant files (videos, json, jpgs).
+    target_labels = ['best', 'good', 'normal', 'bad', 'worst']
+    candidates = []
+
+    # top-level evaluation folders commonly used in this dataset
+    eval_dirs = ['true', 'false']
+    for ed in eval_dirs:
+        base = csv_root / ed
+        if not base.exists():
+            continue
+        # check two possible layouts: label dirs directly under true/false,
+        # or csv_root/label/skeleton_crop (if labels are at top-level).
+        for lab in target_labels:
+            # prefer csv_root/ed/label/skeleton_crop
+            sc = base / lab / 'skeleton_crop'
+            if sc.exists():
+                candidates.append(sc)
+            else:
+                # fallback: csv_root/label/skeleton_crop (no true/false)
+                sc2 = csv_root / lab / 'skeleton_crop'
+                if sc2.exists():
+                    candidates.append(sc2)
+
+    # As a fallback, if no candidates were found, try the legacy path under
+    # csv_root/*/skeleton_crop to be permissive but still avoid scanning all files.
+    if not candidates:
+        for p in csv_root.iterdir():
+            sc = p / 'skeleton_crop'
+            if sc.exists():
+                candidates.append(sc)
+
+    # Collect CSV files from the selected skeleton_crop folders only.
+    all_csvs = []
+    for c in candidates:
+        all_csvs.extend([p for p in c.iterdir() if p.suffix.lower() == '.csv'])
+    all_csvs = sorted(all_csvs)
+    print(f"Found {len(all_csvs)} CSV files under selected skeleton_crop folders of {csv_root}")
 
     annotations = []
     samples = []
-    for csv in all_csvs:
-        label = detect_label_from_path(csv)
-        # use relative stem as frame_dir to be consistent with other tools
-        frame_dir = csv.stem
+    for csv in tqdm(all_csvs, desc="Processing CSVs", unit="file"):
+        # Determine label from the path: expect one of the target labels to be
+        # in the ancestry. If not found, fall back to detect_label_from_path.
+        parts = [s.lower() for s in csv.parts]
+        label = None
+        for name, lab in {
+            'worst': 0,
+            'bad': 1,
+            'normal': 2,
+            'good': 3,
+            'best': 4,
+        }.items():
+            if name in parts:
+                label = lab
+                break
+        if label is None:
+            label = detect_label_from_path(csv)
+
+        # Derive a unique frame_dir relative to the csv_root. Prefer the
+        # parent folder name (the sample folder inside skeleton_crop). If the
+        # CSVs are named as <sample>.csv, use that stem but prefix with the
+        # label and eval dir to ensure uniqueness across the dataset.
+        try:
+            rel = csv.relative_to(csv_root)
+            # rel might be like 'false/bad/skeleton_crop/20201208_.../skeleton.csv'
+            # Use parts from rel to construct a stable frame_dir
+            rel_parts = list(rel.parts)
+            # drop the trailing file name and 'skeleton_crop' if present
+            if rel_parts[-2].lower() == 'skeleton_crop':
+                parent_sample = rel_parts[-1]
+                # parent_sample is the csv filename; use its stem
+                frame_dir = f"{rel_parts[0]}/{rel_parts[1]}/{Path(parent_sample).stem}"
+            else:
+                frame_dir = Path(csv.stem).name
+        except Exception:
+            # fallback
+            frame_dir = csv.stem
         ann = csv_to_annotation(csv, frame_dir=frame_dir, label=label,
                                 img_shape=img_shape, normalize_method=normalize_method)
         if ann is None:
@@ -114,6 +256,65 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
             continue
         annotations.append(ann)
         samples.append(frame_dir)
+
+    # Normalize/validate collected annotations: ensure 'keypoint' is a numpy
+    # ndarray of dtype float32 and shape (M, T, V, 2) where M is number of
+    # persons (usually 1). This accepts the legacy (T, V, 2) format produced
+    # by csv_to_annotation and wraps it into (1, T, V, 2). We also populate
+    # helpful metadata fields expected by the MMAction2 pipeline.
+    cleaned_annotations = []
+    for ann in tqdm(annotations, desc="Normalizing annotations", unit="sample"):
+        kp = ann.get('keypoint')
+        if isinstance(kp, list):
+            try:
+                kp = np.stack([np.array(f) for f in kp], axis=0).astype(np.float32)
+            except Exception:
+                print(f"[WARN] could not convert keypoint list for {ann.get('frame_dir')}, skipping sample")
+                continue
+        elif isinstance(kp, np.ndarray):
+            kp = kp.astype(np.float32)
+        else:
+            try:
+                kp = np.array(kp, dtype=np.float32)
+            except Exception:
+                print(f"[WARN] unknown keypoint type for {ann.get('frame_dir')}, skipping sample")
+                continue
+
+        # Accept legacy shape (T, V, 2) and wrap to (1, T, V, 2)
+        if kp.ndim == 3 and kp.shape[2] == 2:
+            kp = np.expand_dims(kp, axis=0)  # -> (1, T, V, 2)
+        # If already in (M, T, V, 2), accept as-is
+        elif kp.ndim == 4 and kp.shape[3] == 2:
+            pass
+        else:
+            print(f"[WARN] keypoint for {ann.get('frame_dir')} has invalid shape {getattr(kp, 'shape', None)}, skipping")
+            continue
+
+        # Ensure dtype
+        kp = kp.astype(np.float32)
+
+        # Populate/ensure metadata fields downstream components expect
+        total_frames = kp.shape[1]
+        img_shape = ann.get('img_shape', (1080, 1920))
+        # keypoint_score: default to ones if not provided (shape: M, T, V)
+        if 'keypoint_score' in ann:
+            kps = np.array(ann['keypoint_score'], dtype=np.float32)
+            # if legacy (T, V) -> wrap
+            if kps.ndim == 2:
+                kps = np.expand_dims(kps, axis=0)
+        else:
+            kps = np.ones((kp.shape[0], kp.shape[1], kp.shape[2]), dtype=np.float32)
+
+        ann['keypoint'] = kp
+        ann['keypoint_score'] = kps
+        ann['total_frames'] = int(total_frames)
+        ann['original_shape'] = tuple(ann.get('original_shape', img_shape))
+        ann['img_shape'] = tuple(img_shape)
+        ann.setdefault('metainfo', {'frame_dir': ann.get('frame_dir')})
+
+        cleaned_annotations.append(ann)
+
+    annotations = cleaned_annotations
 
     # optional train/val split
     random.seed(seed)

@@ -1,0 +1,278 @@
+#!/usr/bin/env python
+"""
+finetune_stgcn_test.py
+
+Run a finetuned ST-GCN checkpoint (5-class) against a binary test PKL
+and map the 5-class predictions to binary labels for evaluation.
+
+Mapping used (same as training label mapping):
+  worst(0), bad(1) -> binary 0 (false)
+  normal(2), good(3), best(4) -> binary 1 (true)
+
+This script mirrors the test setup in `stgcn_tester.py`/`my_stgcnpp.py`:
+ - loads a config, overrides test_dataloader.dataset.ann_file
+ - appends a DumpResults evaluator to write a result PKL
+ - runs Runner.test() inline and parses the result PKL
+ - compares predictions (argmax) to ground-truth labels from test PKL
+ - prints summary metrics and saves a per-sample CSV
+"""
+
+import argparse
+import os
+import sys
+import tempfile
+import uuid
+import pickle
+from pathlib import Path
+import json
+import csv
+
+import numpy as np
+
+MM_ROOT = r"D:\mmaction2"
+if MM_ROOT not in sys.path:
+    sys.path.insert(0, MM_ROOT)
+
+from mmengine.config import Config
+from mmengine.runner import Runner
+from mmengine.fileio import load as mmengine_load
+import torch
+
+
+def load_annotations_from_pkl(pkl_path, split_name='xsub_val'):
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    anns = data.get('annotations', [])
+    split = data.get('split', {})
+    ids = None
+    if split_name in split:
+        ids = set(split[split_name])
+    # identifier: filename or frame_dir
+    identifier = 'filename' if ('filename' in anns[0] if anns else False) else 'frame_dir'
+    if ids is not None:
+        filtered = [a for a in anns if a.get(identifier) in ids]
+    else:
+        filtered = anns
+    return filtered, identifier
+
+
+def extract_pred_idx(item):
+    # item is one element from DumpResults (dict)
+    if 'pred_label' in item:
+        try:
+            return int(item['pred_label'])
+        except Exception:
+            return None
+    if 'pred_labels' in item:
+        try:
+            return int(item['pred_labels'])
+        except Exception:
+            return None
+    if 'pred_scores' in item:
+        try:
+            arr = np.asarray(item['pred_scores'])
+            return int(np.argmax(arr))
+        except Exception:
+            return None
+    return None
+
+
+def map_to_binary(pred_idx):
+    # label mapping: 0: worst, 1: bad, 2: normal, 3: good, 4: best
+    # map 0,1 -> 0 ; 2,3,4 -> 1
+    if pred_idx is None:
+        return None
+    return 1 if int(pred_idx) >= 2 else 0
+
+
+def compute_metrics(gt, pred):
+    # gt and pred are lists of 0/1 (pred may contain None)
+    assert len(gt) == len(pred)
+    tp = tn = fp = fn = 0
+    valid = 0
+    for g, p in zip(gt, pred):
+        if p is None:
+            continue
+        valid += 1
+        if g == 1 and p == 1:
+            tp += 1
+        elif g == 0 and p == 0:
+            tn += 1
+        elif g == 0 and p == 1:
+            fp += 1
+        elif g == 1 and p == 0:
+            fn += 1
+    accuracy = (tp + tn) / valid if valid > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    return dict(tp=tp, tn=tn, fp=fp, fn=fn, valid=valid, accuracy=accuracy, precision=precision, recall=recall, f1=f1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default=os.path.join(MM_ROOT, 'configs', 'skeleton', 'stgcnpp', 'my_stgcnpp.py'),
+                        help='MMAction2 config file (default: my_stgcnpp in mmaction2 configs)')
+    parser.add_argument('--checkpoint', required=True, help='Path to finetuned .pth checkpoint')
+    parser.add_argument('--test-pkl', default=r"D:\golfDataset\crop_pkl\skeleton_dataset_test.pkl",
+                        help='Test PKL with binary labels (true/false)')
+    parser.add_argument('--split', default='xsub_val', help='split name inside PKL to evaluate')
+    parser.add_argument('--out-csv', default='finetune_test_results.csv', help='Per-sample results CSV')
+    args = parser.parse_args()
+
+    cfg = Config.fromfile(args.config)
+
+    # override checkpoint and test ann file
+    cfg.load_from = args.checkpoint
+    # ensure test dataloader ann_file is set
+    cfg.test_dataloader.dataset.ann_file = str(args.test_pkl)
+    cfg.test_dataloader.dataset.split = args.split
+
+    # Inspect checkpoint to detect trained num_classes and compare to cfg
+    def inspect_checkpoint_for_num_classes(ckpt_path):
+        # returns inferred_num_classes or None
+        try:
+            # Use torch.load to be robust to plain-state-dict or meta dict formats
+            data = torch.load(ckpt_path, map_location='cpu')
+        except Exception:
+            try:
+                data = mmengine_load(ckpt_path)
+            except Exception:
+                print(f"Warning: failed to load checkpoint for inspection: {ckpt_path}")
+                return None
+        # common layouts: {'meta':..., 'state_dict':...} or direct state_dict
+        state_dict = None
+        if isinstance(data, dict):
+            if 'state_dict' in data:
+                state_dict = data['state_dict']
+            elif 'model' in data:
+                state_dict = data['model']
+            else:
+                # assume it's a state_dict already
+                state_dict = data
+        else:
+            # unexpected
+            return None
+        # find keys that look like head weights, e.g., 'head.fc.weight' or 'cls_head.fc_cls.weight' etc.
+        candidate_keys = [k for k in state_dict.keys() if 'head' in k and 'weight' in k and getattr(state_dict[k], 'ndim', None) == 2]
+        if not candidate_keys:
+            # fallback: search for linear weight with out_features matching classes
+            candidate_keys = [k for k, v in state_dict.items() if isinstance(v, (torch.Tensor,)) and getattr(v, 'ndim', None) == 2]
+        if not candidate_keys:
+            return None
+        # pick the smallest reasonable out_features among candidates as num_classes
+        out_features = [state_dict[k].shape[0] for k in candidate_keys]
+        out_features = [int(x) for x in out_features if int(x) > 1 and int(x) < 1000]
+        if not out_features:
+            return None
+        inferred = int(min(out_features))
+        return inferred
+
+    inferred_nc = inspect_checkpoint_for_num_classes(args.checkpoint)
+    if inferred_nc is not None:
+        cfg_nc = None
+        try:
+            cfg_nc = int(cfg.model.cls_head.num_classes)
+        except Exception:
+            cfg_nc = None
+        if cfg_nc is None:
+            print(f"Config missing model.cls_head.num_classes; setting to checkpoint-inferred {inferred_nc}")
+            cfg.model.cls_head.num_classes = inferred_nc
+        elif cfg_nc != inferred_nc:
+            print(f"Warning: config.num_classes={cfg_nc} but checkpoint head indicates {inferred_nc} classes.")
+            print("Overriding cfg.model.cls_head.num_classes to match checkpoint to avoid shape mismatch at load time.")
+            cfg.model.cls_head.num_classes = inferred_nc
+
+    # prepare a DumpResults evaluator to capture result.pkl
+    unique_id = uuid.uuid4().hex[:8]
+    repo_results_dir = Path(__file__).parent / 'results'
+    try:
+        repo_results_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        repo_results_dir = Path(tempfile.gettempdir())
+    result_pkl_path = repo_results_dir / f"finetune_test_result_{unique_id}.pkl"
+    dump_metric = dict(type='DumpResults', out_file_path=str(result_pkl_path))
+    if isinstance(cfg.test_evaluator, (list, tuple)):
+        cfg.test_evaluator = list(cfg.test_evaluator)
+        cfg.test_evaluator = [e for e in cfg.test_evaluator if e.get('type') != 'DumpResults']
+        cfg.test_evaluator.append(dump_metric)
+    else:
+        cfg.test_evaluator = [cfg.test_evaluator, dump_metric]
+
+    # safe runtime tweaks
+    cfg.launcher = 'none'
+    if hasattr(cfg, 'env_cfg'):
+        if hasattr(cfg.env_cfg, 'mp_cfg'):
+            cfg.env_cfg.mp_cfg.mp_start_method = 'fork'
+        if hasattr(cfg.env_cfg, 'dist_cfg'):
+            cfg.env_cfg.dist_cfg.backend = 'gloo'
+    if hasattr(cfg, 'default_hooks') and isinstance(cfg.default_hooks, dict):
+        if 'visualization' in cfg.default_hooks:
+            cfg.default_hooks.visualization.enable = False
+
+    print(f"Using config: {args.config}")
+    print(f"Using checkpoint: {args.checkpoint}")
+    print(f"Test PKL: {args.test_pkl} -> split: {args.split}")
+    print(f"Result PKL will be written to: {result_pkl_path}")
+
+    # try to register modules (mmaction)
+    try:
+        try:
+            from mmaction.utils import register_all_modules
+        except Exception:
+            from mmaction.utils.setup_env import register_all_modules
+        register_all_modules(init_default_scope=True)
+    except Exception as _e:
+        print(f"Warning: register_all_modules failed: {_e}")
+
+    # Ensure cfg.work_dir exists - Runner.from_cfg expects cfg['work_dir'] to be present
+    try:
+        if cfg.get('work_dir', None) is None:
+            cfg.work_dir = str(repo_results_dir / f"work_dir_{unique_id}")
+    except Exception:
+        # fallback
+        cfg.work_dir = str(repo_results_dir)
+
+    # Load ground-truth annotations from test PKL for comparison
+    anns, identifier = load_annotations_from_pkl(args.test_pkl, split_name=args.split)
+    gt_labels = [int(a.get('label', 0)) for a in anns]
+    ids = [a.get(identifier) for a in anns]
+    print(f"Loaded {len(anns)} annotations from test PKL (identifier={identifier})")
+
+    # run test
+    try:
+        runner = Runner.from_cfg(cfg)
+        runner.test()
+    except Exception as e:
+        print('runner.test() failed:', e)
+        raise
+
+    if not result_pkl_path.exists():
+        raise FileNotFoundError(f"Result PKL not found after test: {result_pkl_path}")
+
+    with open(result_pkl_path, 'rb') as f:
+        result_list = pickle.load(f)
+
+    # parse predictions
+    pred_idx_list = [extract_pred_idx(item) for item in result_list]
+    pred_bin_list = [map_to_binary(p) for p in pred_idx_list]
+
+    # compute metrics vs ground truth (note: gt_labels are 0/1)
+    metrics = compute_metrics(gt_labels, pred_bin_list)
+
+    print('\nEvaluation Summary:')
+    print(json.dumps(metrics, indent=2))
+
+    # save per-sample CSV
+    out_csv = Path(args.out_csv)
+    with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
+        writer = csv.writer(csvf)
+        writer.writerow(['id', 'gt_label', 'pred_class_5', 'pred_bin'])
+        for idv, g, p5, pb in zip(ids, gt_labels, pred_idx_list, pred_bin_list):
+            writer.writerow([idv, g, p5 if p5 is not None else '', pb if pb is not None else ''])
+
+    print(f"Per-sample results written to: {out_csv}")
+
+
+if __name__ == '__main__':
+    main()

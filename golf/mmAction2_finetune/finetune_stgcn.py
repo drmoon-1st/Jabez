@@ -25,8 +25,8 @@ def main():
                         help='MMAction2 config.py 경로 (MMAction2 루트 기준)')
     parser.add_argument('--pretrained', required=True,
                         help='사전학습된 ST-GCN 체크포인트(.pth)')
-    parser.add_argument('--test-pkl',   required=True,
-                        help='(optional) test annotation PKL 경로')
+    parser.add_argument('--test-pkl',   required=False, default='',
+                        help='(optional) test annotation PKL 경로 (omit to skip test override)')
     parser.add_argument('--work-dir',   default='work_dirs/finetune_stgcn',
                         help='MMAction2 --work-dir')
     parser.add_argument('--device',     default='cuda:0',
@@ -85,7 +85,9 @@ def main():
         finetune_cfg,
         '--work-dir', args.work_dir,
         '--cfg-options',
-        f"load_from={args.pretrained}",
+        # Avoid setting global load_from (would load full model including head).
+        # Instead set the backbone init_cfg checkpoint so only the backbone is initialized.
+        f"model.backbone.init_cfg.checkpoint={args.pretrained}",
         f"train_dataloader.dataset.dataset.ann_file={args.input_pkl}",
         f"train_dataloader.dataset.dataset.split=xsub_train",
         f"val_dataloader.dataset.ann_file={args.input_pkl}",
