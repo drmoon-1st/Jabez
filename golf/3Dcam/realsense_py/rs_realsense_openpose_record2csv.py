@@ -26,7 +26,7 @@ import pyrealsense2 as rs
 from interpolation import mask_sentinel_and_confidence, interpolate_df
 
 # ================= 사용자 환경 설정 =================
-OPENPOSE_EXE  = Path(r"C:/openpose/openpose/bin/OpenPoseDemo.exe")  # OpenPoseDemo.exe 경로
+OPENPOSE_EXE  = Path(r"C:/openpose/bin/OpenPoseDemo.exe")  # OpenPoseDemo.exe 경로
 OPENPOSE_ROOT = OPENPOSE_EXE.parent.parent
 MODEL_FOLDER  = OPENPOSE_ROOT / "models"                             # .../openpose/models
 COCO_MODEL    = MODEL_FOLDER / "pose/coco/pose_iter_440000.caffemodel"
