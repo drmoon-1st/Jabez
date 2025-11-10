@@ -20,6 +20,8 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+BASE_DIR = r'D:\golfDataset\dataset\train\balanced_true\crop_keypoint'
+
 
 # Body_25 canonical joint names (OpenPose BODY_25)
 BODY25 = [
@@ -238,8 +240,8 @@ def process_file(path: Path, out_dir: Path, conf_thresh: float = 0.0, interp_fil
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input-dir', type=str, default=r'D:\golfDataset\dataset\train\balanced_true\crop_keypoint', help='Folder containing *_crop.csv files')
-    parser.add_argument('--output-dir', type=str, default=str(Path(__file__).resolve().parent / 'converted'), help='Output folder')
+    parser.add_argument('--input-dir', type=str, default=BASE_DIR, help='Folder containing *_crop.csv files')
+    parser.add_argument('--output-dir', type=str, default=BASE_DIR / 'converted', help='Output folder')
     parser.add_argument('--conf-thresh', type=float, default=0.0, help='Confidence threshold to mask before interpolation')
     parser.add_argument('--interp-fill', type=str, default='zero', choices=['none','ffill','bfill','nearest','zero'], help='Fill method after interpolation')
     parser.add_argument('--interp-limit', type=int, default=None, help='Max consecutive NaNs to interpolate')
