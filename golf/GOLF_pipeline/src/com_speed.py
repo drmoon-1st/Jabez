@@ -37,6 +37,7 @@ import numpy as np
 import cv2
 import glob
 from typing import Optional, Tuple, Dict, List, Union
+import json
 
 try:
     import yaml
@@ -61,6 +62,237 @@ def get_xyz_cols(df: pd.DataFrame, name: str):
         z_col = cols_map[name]['z']
         return df[[x_col, y_col, z_col]].to_numpy(float)
     return None
+
+def is_dataframe_3d(df: pd.DataFrame) -> bool:
+    """데이터프레임이 3D(z 포함) 좌표를 갖는지 판단"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    for _, axes in cols_map.items():
+        if 'x' in axes and 'y' in axes and 'z' in axes:
+            return True
+    # z 접미사가 하나라도 있으면 3D로 간주
+    for c in df.columns:
+        s = str(c)
+        if s.endswith('_z') or s.endswith('__z') or s.endswith('_Z3D'):
+            return True
+    return False
+
+
+# =========================================================
+# 추가: 3D 분석 보조 유틸 (Impact/X-Factor/COM 이동)
+# =========================================================
+def _ensure_np(a, n: int, m: int = 3) -> np.ndarray:
+    if a is None:
+        return np.full((n, m), np.nan, dtype=float)
+    arr = np.asarray(a, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, m)
+    return arr
+
+def ensure_direction_continuity(V: np.ndarray) -> np.ndarray:
+    out = V.copy()
+    for i in range(1, len(out)):
+        a, b = out[i-1], out[i]
+        if not (np.any(np.isnan(a)) or np.any(np.isnan(b))):
+            if float(np.dot(b, a)) < 0:
+                out[i] = -b
+    return out
+
+def angles_deg_for_plane(V: np.ndarray, axis_a: int, axis_b: int) -> np.ndarray:
+    va, vb = V[:, axis_a], V[:, axis_b]
+    ang_unwrapped = np.unwrap(np.arctan2(vb, va))
+    return np.degrees(ang_unwrapped)
+
+def smooth_median_then_moving(x: np.ndarray, w: int = 5) -> np.ndarray:
+    s = pd.Series(x)
+    med = s.rolling(w, center=True, min_periods=1).median()
+    sm = med.rolling(w, center=True, min_periods=1).mean()
+    return sm.to_numpy()
+
+def compute_stance_mid_and_width(df: pd.DataFrame) -> Tuple[np.ndarray, float]:
+    """스탠스 중심(프레임별)과 폭(스칼라, median) 계산.
+    R/L 발목의 X를 사용. 결측은 NaN 처리 후 median으로 폭 계산.
+    """
+    N = len(df)
+    RA = get_xyz_cols(df, 'RAnkle'); LA = get_xyz_cols(df, 'LAnkle')
+    RA = _ensure_np(RA, N); LA = _ensure_np(LA, N)
+    rax, lax = RA[:, 0], LA[:, 0]
+    stance_mid = (rax + lax) / 2.0
+    with np.errstate(invalid='ignore'):
+        width_inst = np.abs(rax - lax)
+        stance_width = float(np.nanmedian(width_inst)) if np.any(~np.isnan(width_inst)) else np.nan
+    return stance_mid, stance_width
+
+def compute_stance_mid_and_width_2d(df: pd.DataFrame) -> Tuple[np.ndarray, float]:
+    """2D CSV에서 스탠스 중심(프레임별)과 폭(median) 계산 (R/L 발목 x 사용)"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    N = len(df)
+    rax = np.full(N, np.nan, dtype=float)
+    lax = np.full(N, np.nan, dtype=float)
+    rx = (cols_map.get('RAnkle') or {}).get('x')
+    lx = (cols_map.get('LAnkle') or {}).get('x')
+    if rx in df.columns:
+        rax = pd.to_numeric(df[rx], errors='coerce').to_numpy(dtype=float)
+    if lx in df.columns:
+        lax = pd.to_numeric(df[lx], errors='coerce').to_numpy(dtype=float)
+    stance_mid = (rax + lax) / 2.0
+    with np.errstate(invalid='ignore'):
+        width_inst = np.abs(rax - lax)
+        stance_width = float(np.nanmedian(width_inst)) if np.any(~np.isnan(width_inst)) else np.nan
+    return stance_mid, stance_width
+
+def detect_impact_by_crossing_3d(df: pd.DataFrame, stance_mid: np.ndarray) -> int:
+    """임팩트: RWrist_X3D가 스탠스 중심을 +방향으로 처음 교차하는 프레임.
+    조건: w[i-1] < mid[i-1] and w[i] >= mid[i] and dx[i] > 0
+    없으면 argmax(w)
+    """
+    N = len(df)
+    RW = get_xyz_cols(df, 'RWrist')
+    RW = _ensure_np(RW, N)
+    w = RW[:, 0]
+    dx = np.diff(w, prepend=w[0])
+    for i in range(1, N):
+        if np.isnan(w[i-1]) or np.isnan(w[i]) or np.isnan(stance_mid[i-1]) or np.isnan(stance_mid[i]):
+            continue
+        if (w[i-1] < stance_mid[i-1]) and (w[i] >= stance_mid[i]) and (dx[i] > 0):
+            return int(i)
+    with np.errstate(invalid='ignore'):
+        return int(np.nanargmax(w)) if np.any(~np.isnan(w)) else N - 1
+
+def detect_impact_by_crossing_2d(df: pd.DataFrame, stance_mid: np.ndarray) -> int:
+    """2D: RWrist_x가 스탠스 중심을 +방향으로 처음 교차하는 프레임."""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    rwx_col = (cols_map.get('RWrist') or {}).get('x')
+    if not rwx_col or rwx_col not in df.columns:
+        return len(df) - 1 if len(df) > 0 else 0
+    w = pd.to_numeric(df[rwx_col], errors='coerce').to_numpy(dtype=float)
+    N = len(w)
+    dx = np.diff(w, prepend=w[0])
+    for i in range(1, N):
+        if np.isnan(w[i-1]) or np.isnan(w[i]) or np.isnan(stance_mid[i-1]) or np.isnan(stance_mid[i]):
+            continue
+        if (w[i-1] < stance_mid[i-1]) and (w[i] >= stance_mid[i]) and (dx[i] > 0):
+            return int(i)
+    with np.errstate(invalid='ignore'):
+        return int(np.nanargmax(w)) if np.any(~np.isnan(w)) else N - 1
+
+def compute_xfactor_by_planes(df: pd.DataFrame) -> Dict[str, np.ndarray]:
+    """세 평면(X-Z, X-Y, Y-Z)에서 X-Factor 시퀀스 생성.
+    어깨/골반 벡터의 방향 일관화 후 각도(unwrap) 차이.
+    """
+    N = len(df)
+    Ls = _ensure_np(get_xyz_cols(df, 'LShoulder'), N)
+    Rs = _ensure_np(get_xyz_cols(df, 'RShoulder'), N)
+    Lh = _ensure_np(get_xyz_cols(df, 'LHip'), N)
+    Rh = _ensure_np(get_xyz_cols(df, 'RHip'), N)
+
+    sh = ensure_direction_continuity(Rs - Ls)
+    pe = ensure_direction_continuity(Rh - Lh)
+
+    planes = {"X-Z": (0, 2), "X-Y": (0, 1), "Y-Z": (1, 2)}
+    out = {}
+    for name, (ax1, ax2) in planes.items():
+        ang_sh = angles_deg_for_plane(sh, ax1, ax2)
+        ang_pe = angles_deg_for_plane(pe, ax1, ax2)
+        xf = ang_sh - ang_pe
+        xf = smooth_median_then_moving(xf, w=5)
+        out[name] = xf
+    return out
+
+def select_plane_and_backswing_top(xf_by_plane: Dict[str, np.ndarray], impact_idx: int) -> Tuple[str, int]:
+    """Impact 이전 abs(xf) 분포로 plane 선택 및 Backswing Top 프레임.
+    - 후보: median in (5,80)
+    - 선택: (q90-q10) 최소
+    - Top: argmax(|xf[:impact]|)
+    """
+    best_plane = None
+    best_spread = None
+    for name, xf in xf_by_plane.items():
+        upto = max(min(impact_idx, len(xf) - 1), 0)
+        pre = np.abs(xf[:upto+1])
+        if pre.size == 0 or np.all(np.isnan(pre)):
+            continue
+        q10, q90 = np.nanpercentile(pre, [10, 90])
+        med = np.nanmedian(pre)
+        if not (5 < med < 80):
+            continue
+        spread = q90 - q10
+        if best_spread is None or spread < best_spread:
+            best_spread = spread
+            best_plane = name
+    if best_plane is None:
+        best_plane = 'X-Z'
+    # backswing top
+    xf = xf_by_plane[best_plane]
+    upto = max(min(impact_idx, len(xf) - 1), 0)
+    with np.errstate(invalid='ignore'):
+        top = int(np.nanargmax(np.abs(xf[:upto+1]))) if upto >= 0 else 0
+    return best_plane, top
+
+def compute_com_x_rel(df: pd.DataFrame, stance_mid: np.ndarray) -> np.ndarray:
+    """COM_x = mean([LHip_X3D, RHip_X3D, LShoulder_X3D, RShoulder_X3D])
+    com_rel = com_x - stance_mid_x
+    """
+    N = len(df)
+    Ls = _ensure_np(get_xyz_cols(df, 'LShoulder'), N)
+    Rs = _ensure_np(get_xyz_cols(df, 'RShoulder'), N)
+    Lh = _ensure_np(get_xyz_cols(df, 'LHip'), N)
+    Rh = _ensure_np(get_xyz_cols(df, 'RHip'), N)
+    x_stack = np.vstack([Ls[:, 0], Rs[:, 0], Lh[:, 0], Rh[:, 0]])  # (4, N)
+    with np.errstate(invalid='ignore'):
+        com_x = np.nanmean(x_stack, axis=0)
+    return com_x - stance_mid
+
+def compute_com_x_rel_2d(df: pd.DataFrame, stance_mid: np.ndarray) -> np.ndarray:
+    """2D에서 COM_x(어깨/골반 x 평균) - stance_mid"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    def col_x(j):
+        c = (cols_map.get(j) or {}).get('x')
+        return pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float) if c in df.columns else np.full(len(df), np.nan)
+    Ls = col_x('LShoulder'); Rs = col_x('RShoulder'); Lh = col_x('LHip'); Rh = col_x('RHip')
+    x_stack = np.vstack([Ls, Rs, Lh, Rh])
+    with np.errstate(invalid='ignore'):
+        com_x = np.nanmean(x_stack, axis=0)
+    return com_x - stance_mid
+
+def find_transition_index(com_rel: np.ndarray, start: int, end: int) -> Optional[int]:
+    """Transition(다운스윙 탑): 첫 i in [start, end) with dcom[i-1] ≤ 0 and dcom[i] > 0"""
+    if start is None:
+        start = 0
+    if end is None:
+        end = len(com_rel)
+    if end <= start + 1:
+        return None
+    # NaN 보간 후 도함수 근사
+    s = pd.Series(com_rel).interpolate(limit_direction='both').fillna(0)
+    d = np.gradient(s.to_numpy())
+    for i in range(max(start, 1), min(end, len(d))):
+        if d[i-1] <= 0 and d[i] > 0:
+            return int(i)
+    return None
+
+def grade_back_shift(pct: float) -> str:
+    # 백스윙 이동: <−10 부족 / −15~−25 적정 / <−30 과다
+    if not np.isfinite(pct):
+        return '정보 없음'
+    if pct > -10:
+        return '부족'
+    if -25 <= pct <= -15:
+        return '적정'
+    if pct < -30:
+        return '과다'
+    return '보통'
+
+def grade_down_shift(pct: float) -> str:
+    # 다운스윙 이동: <+10 부족 / +20~+30 적정 / >+35 과다
+    if not np.isfinite(pct):
+        return '정보 없음'
+    if pct < 10:
+        return '부족'
+    if 20 <= pct <= 30:
+        return '적정'
+    if pct > 35:
+        return '과다'
+    return '보통'
 
 
 def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
@@ -189,6 +421,23 @@ def load_cfg(p: Path):
             raise RuntimeError("pip install pyyaml")
         return yaml.safe_load(p.read_text(encoding="utf-8"))
     raise ValueError("Use YAML for analyze config.")
+
+def speed_2d(points_xy: np.ndarray, fps: Optional[float]):
+    """2D 속도 계산 (px/s 또는 px/frame)"""
+    N = len(points_xy)
+    v = np.full(N, np.nan, dtype=float)
+    for i in range(1, N):
+        a, b = points_xy[i-1], points_xy[i]
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+            continue
+        v[i] = float(np.linalg.norm(b - a))
+    if fps and fps > 0:
+        v = v * float(fps)
+        unit = "px/s"
+    else:
+        unit = "px/frame"
+    v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
+    return v, unit
 
 # =========================================================
 # 2D 좌표 스무딩 유틸리티 (점프 제한 제거, 대체 필터 추가)
@@ -797,7 +1046,7 @@ def main():
     codec = str(cfg.get("codec", "mp4v"))
     
     # 출력 경로 (COM 전용)
-    out_csv = Path(cfg["metrics_csv"]).parent / "com_speed_metrics.csv"
+    out_dir = Path(cfg["metrics_csv"]).parent
     out_mp4 = Path(cfg["overlay_mp4"]).parent / "com_speed_analysis.mp4"
 
     # 1) CSV 로드
@@ -818,22 +1067,129 @@ def main():
     ignore_cfg = set(cfg.get('ignore_joints', [])) if isinstance(cfg.get('ignore_joints', []), list) else set()
     ignore_set = default_ignore.union(ignore_cfg)
 
-    # 2) COM 계산 (3D metrics 데이터 사용)
-    com_pts = compute_com_points_3d(df_metrics, ignore_joints=ignore_set)
-    com_v, com_unit = speed_3d(com_pts, fps)
+    # 2) 차원 감지 후 COM 계산 (2D/3D 자동 분기)
+    use_3d = is_dataframe_3d(df_metrics)
+    if use_3d:
+        com_pts = compute_com_points_3d(df_metrics, ignore_joints=ignore_set)
+        com_v, com_unit = speed_3d(com_pts, fps)
+    else:
+        com2 = compute_com_points_2d(df_metrics, ignore_joints=ignore_set)
+        com_v, com_unit = speed_2d(com2, fps)
+        # 2D에서도 이후 로직 호환을 위해 (N,3) 포맷으로 패딩
+        com_pts = np.hstack([com2, np.full((len(com2), 1), np.nan)]) if len(com2) > 0 else np.full((len(df_metrics), 3), np.nan)
 
-    # 3) 결과 저장
-    metrics = pd.DataFrame({
-        'frame': range(len(df_metrics)),
-        'com_speed': com_v,
-        'com_x': com_pts[:, 0],
-        'com_y': com_pts[:, 1],
-        'com_z': com_pts[:, 2]
-    })
-    
-    ensure_dir(out_csv.parent)
-    metrics.to_csv(out_csv, index=False)
-    print(f"✅ COM 메트릭 저장: {out_csv}")
+    # 3) 결과(기존 CSV 대신 JSON에 포함할 프레임별 데이터 구성)
+    ensure_dir(out_dir)
+    speed_frames = {}
+    for i in range(len(df_metrics)):
+        speed_frames[str(i)] = {
+            "com_speed": float(com_v[i]) if np.isfinite(com_v[i]) else None,
+            "com_x": float(com_pts[i, 0]) if np.isfinite(com_pts[i, 0]) else None,
+            "com_y": float(com_pts[i, 1]) if np.isfinite(com_pts[i, 1]) else None,
+            "com_z": float(com_pts[i, 2]) if np.isfinite(com_pts[i, 2]) else None,
+        }
+
+    # 3b) 스탠스/임팩트/X-Factor/COM 이동 정량화 (차원별 처리)
+    if use_3d:
+        stance_mid, stance_width = compute_stance_mid_and_width(df_metrics)
+        impact_idx = detect_impact_by_crossing_3d(df_metrics, stance_mid)
+        xf_by_plane = compute_xfactor_by_planes(df_metrics)
+        chosen_plane, backswing_top = select_plane_and_backswing_top(xf_by_plane, impact_idx)
+        com_rel = compute_com_x_rel(df_metrics, stance_mid)
+    else:
+        stance_mid, stance_width = compute_stance_mid_and_width_2d(df_metrics)
+        impact_idx = detect_impact_by_crossing_2d(df_metrics, stance_mid)
+        # 2D에서는 X-Factor 평면 분석 스킵
+        chosen_plane = '2D'
+        # 백스윙 탑: 임팩트 전 구간에서 |COM_rel| 최대 프레임
+        com_rel = compute_com_x_rel_2d(df_metrics, stance_mid)
+        upto = max(min(impact_idx, len(com_rel) - 1), 0)
+        pre = np.abs(com_rel[:upto+1]) if len(com_rel) > 0 else np.array([])
+        if pre.size == 0 or np.all(np.isnan(pre)):
+            backswing_top = 0
+        else:
+            with np.errstate(invalid='ignore'):
+                backswing_top = int(np.nanargmax(pre))
+    transition_idx = find_transition_index(com_rel, backswing_top, impact_idx)
+
+    # 기준선(주소) 및 주요 시점 값
+    addr = float(np.nanmean(com_rel[:min(5, len(com_rel))])) if len(com_rel) > 0 else np.nan
+    back_at_top = float(com_rel[backswing_top]) if 0 <= backswing_top < len(com_rel) else np.nan
+    imp_at = float(com_rel[impact_idx]) if 0 <= impact_idx < len(com_rel) else np.nan
+
+    # 퍼센트 정량화 (stance_width 기준)
+    if stance_width and np.isfinite(stance_width) and stance_width != 0:
+        back_shift_pct = 100.0 * (back_at_top - addr) / stance_width
+        down_shift_pct = 100.0 * (imp_at - back_at_top) / stance_width
+        impact_offset_pct = 100.0 * (imp_at - addr) / stance_width
+        rms_pct = 100.0 * float(np.sqrt(np.nanmean((com_rel[:impact_idx] - addr)**2))) / stance_width if impact_idx > 0 else np.nan
+    else:
+        back_shift_pct = down_shift_pct = impact_offset_pct = rms_pct = np.nan
+
+    # 등급화
+    back_grade = grade_back_shift(back_shift_pct)
+    down_grade = grade_down_shift(down_shift_pct)
+
+    # 결과 요약(shift) 오브젝트 구성 (추후 metrics/com_shift.summary 로 포함)
+    result_obj = {
+        'impact_frame': int(impact_idx),
+        'backswing_top_frame': int(backswing_top),
+        'transition_frame': (int(transition_idx) if transition_idx is not None else None),
+        'chosen_plane': chosen_plane,
+        'stance_width': float(stance_width) if stance_width is not None else None,
+        'addr_com_x': addr,
+        'back_at_top_com_x': back_at_top,
+        'impact_com_x': imp_at,
+        'back_shift_pct': back_shift_pct,
+        'down_shift_pct': down_shift_pct,
+        'impact_offset_pct': impact_offset_pct,
+        'rms_pct': rms_pct,
+        'back_shift_grade': back_grade,
+        'down_shift_grade': down_grade,
+    }
+    # 선택 평면 X-Factor와 COM 상대량 시계열(JSON 프레임 사전 구성)
+    chosen_xf = xf_by_plane[chosen_plane] if use_3d else np.full(len(df_metrics), np.nan)
+    shift_frames = {}
+    for i in range(len(df_metrics)):
+        v_xf = chosen_xf[i] if i < len(chosen_xf) else np.nan
+        v_mid = stance_mid[i] if i < len(stance_mid) else np.nan
+        v_rel = com_rel[i] if i < len(com_rel) else np.nan
+        shift_frames[str(i)] = {
+            "xfactor_deg": float(v_xf) if np.isfinite(v_xf) else None,
+            "stance_mid_x": float(v_mid) if np.isfinite(v_mid) else None,
+            "com_rel_x": float(v_rel) if np.isfinite(v_rel) else None,
+        }
+
+    # 단일 JSON 파일 구성 (swing/xfactor와 동일 스키마: summary + metrics_data)
+    job_id = cfg.get("job_id")
+    out_json = out_dir / "com_metric_result.json"
+    out_obj = {
+        "job_id": job_id,
+    "dimension": "3d" if use_3d else "2d",
+        "metrics": {
+            "com_speed": {
+                "summary": {
+                    "mean_com_speed": float(np.nanmean(com_v)) if len(com_v) else None,
+                    "max_com_speed": float(np.nanmax(com_v)) if len(com_v) else None,
+                    "unit": {
+                        "timeseries_main": com_unit
+                    }
+                },
+                "metrics_data": {
+                    "com_speed_timeseries": speed_frames
+                }
+            },
+            "com_shift": {
+                "summary": result_obj,
+                "metrics_data": {
+                    "com_shift_timeseries": shift_frames
+                }
+            }
+        }
+    }
+
+    Path(out_json).write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f"✅ COM JSON 저장: {out_json}")
 
     # 4) 비디오 오버레이
     #    오버레이 전에 선택적으로 2D 스무딩 적용
@@ -874,13 +1230,105 @@ def main():
     print(f"\n📊 COM Speed 분석 결과:")
     print(f"   평균 COM Speed: {np.nanmean(com_v):.2f} {com_unit}")
     print(f"   최대 COM Speed: {np.nanmax(com_v):.2f} {com_unit}")
+    print(f"\n📊 COM 이동 평가:")
+    print(f"   Impact frame: {impact_idx} | Backswing Top: {backswing_top} | Transition: {transition_idx}")
+    print(f"   Stance width: {stance_width:.4f}")
+    print(f"   Back shift: {back_shift_pct:.1f}% ({back_grade}) | Down shift: {down_shift_pct:.1f}% ({down_grade})")
+    print(f"   Impact offset: {impact_offset_pct:.1f}% | RMS pre-impact: {rms_pct if np.isfinite(rms_pct) else np.nan:.1f}%")
     
-    # COM 분석에 사용된 관절 정보
-    cols_map_3d = parse_joint_axis_map_from_columns(df_metrics.columns, prefer_2d=False)
-    valid_joints = [j for j, axes in cols_map_3d.items() if all(a in axes for a in ('x','y','z'))]
-    
-    print(f"   사용된 관절 수: {len(valid_joints)}개")
-    print(f"   관절 목록: {valid_joints}")
 
 if __name__ == "__main__":
     main()
+ 
+ 
+def run_from_context(ctx: dict):
+    """Standardized runner for COM speed that can be invoked by the controller.
+
+    Expects a context dict (typically locals() from controller) and returns a
+    JSON-serializable dict with keys:
+      - metrics_csv: path to the written CSV (or None)
+      - overlay_mp4: path if an overlay was produced
+      - summary: simple numeric summaries {mean_com_speed, max_com_speed, unit}
+      - overlay_error: error string if overlay failed (non-fatal)
+    """
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = str(ctx.get('job_id', 'job'))
+        # Prefer provided fps; fall back to 30
+        fps = int(ctx.get('fps', 30))
+
+        # Locate dataframes from context (accept multiple common keys)
+        wide3 = ctx.get('df_3d') or ctx.get('wide3') or ctx.get('metrics_df')
+        wide2 = ctx.get('df_2d') or ctx.get('wide2') or ctx.get('overlay_df')
+
+        # If no 2D provided but 3D exists, allow using 3D for metrics and try 2D overlay from 3D if needed
+        if wide2 is None and wide3 is not None:
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
+
+        ensure_dir(dest)
+
+        out = {}
+
+        # Metrics (자동: 3D 또는 2D)
+        use_df = wide3 if wide3 is not None else wide2
+        if use_df is not None:
+            try:
+                try:
+                    use_3d = is_dataframe_3d(use_df)
+                except Exception:
+                    use_3d = False
+
+                if use_3d:
+                    com_pts = compute_com_points_3d(use_df)
+                    v, unit = speed_3d(com_pts, fps)
+                    com_x = com_pts[:, 0]; com_y = com_pts[:, 1]; com_z = com_pts[:, 2]
+                else:
+                    com2 = compute_com_points_2d(use_df)
+                    v, unit = speed_2d(com2, fps)
+                    com_x = com2[:, 0]; com_y = com2[:, 1]; com_z = np.full(len(com2), np.nan)
+
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(len(use_df))),
+                    'com_speed': list(map(float, v.tolist())),
+                    'com_x': [float(x) if np.isfinite(x) else None for x in com_x.tolist()],
+                    'com_y': [float(y) if np.isfinite(y) else None for y in com_y.tolist()],
+                    'com_z': [float(z) if np.isfinite(z) else None for z in com_z.tolist()],
+                })
+                metrics_csv = dest / f"{job_id}_com_speed_metrics.csv"
+                ensure_dir(metrics_csv.parent)
+                metrics_df.to_csv(metrics_csv, index=False)
+                out['metrics_csv'] = str(metrics_csv)
+                out['summary'] = {
+                    'mean_com_speed': float(np.nanmean(v)) if len(v) > 0 else None,
+                    'max_com_speed': float(np.nanmax(v)) if len(v) > 0 else None,
+                    'unit': unit,
+                }
+            except Exception as e:
+                return {'error': f'com_speed metrics failure: {e}'}
+        else:
+            out['metrics_csv'] = None
+
+        # Overlay (2D). Try to use controller-copied images if available
+        overlay_path = dest / f"{job_id}_com_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                com2d = compute_com_points_2d(wide2)
+                # Determine image directory; default to dest/img copied by controller
+                img_dir = Path(ctx.get('img_dir', Path(dest) / 'img'))
+                # Recompute speed for overlay if not from earlier
+                if 'v' not in locals() or 'unit' not in locals() or not isinstance(unit, str):
+                    v_tmp, unit_tmp = speed_2d(com2d, fps)
+                else:
+                    v_tmp, unit_tmp = v, unit
+                overlay_com_video(img_dir, wide2, com2d, v_tmp, unit_tmp, overlay_path, fps, 'mp4v')
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            # non-fatal; record error
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}
