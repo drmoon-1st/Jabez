@@ -1,4 +1,4 @@
-# src/swing_speed.py
+\# src/swing_speed.py
 # -*- coding: utf-8 -*-
 """
 Swing Speed 전용 분석기
@@ -272,13 +272,13 @@ def speed_3d(points_xyz: np.ndarray, fps):
     v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
     return v, unit
 
-def vectorized_speed_m_s(points_xyz: np.ndarray, fps: int) -> np.ndarray:
+def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0) -> np.ndarray:
     """
     벡터화된 손목 3D 속도(m/s) 계산
       Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2)
       Δt = 1 / fps
-      v = Δs / Δt = Δस * fps
-    좌표 단위가 'm'일 때 사용
+      v = (Δs * scale_to_m) * fps
+    scale_to_m: 좌표 단위를 미터로 환산하는 스케일 (m 기준). 예) m:1.0, cm:0.01, mm:0.001
     """
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
         return np.full((len(points_xyz),), np.nan, dtype=float)
@@ -291,7 +291,9 @@ def vectorized_speed_m_s(points_xyz: np.ndarray, fps: int) -> np.ndarray:
     dy = np.diff(X[:, 1], prepend=X[0, 1])
     dz = np.diff(X[:, 2], prepend=X[0, 2])
     ds = np.sqrt(dx**2 + dy**2 + dz**2)
-    v_m_s = ds * float(fps if fps and fps > 0 else 30)
+    # 좌표 단위를 m로 환산
+    ds_m = ds * float(scale_to_m)
+    v_m_s = ds_m * float(fps if fps and fps > 0 else 30)
     if len(v_m_s) > 0:
         v_m_s[0] = 0.0
     return v_m_s
@@ -319,7 +321,161 @@ def detect_impact_by_crossing(wrist_x: np.ndarray, stance_mid_x: np.ndarray) -> 
             impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
     return impact
 
-def analyze_wrist_speed(df: pd.DataFrame, fps: int, wrist: str = "RWrist"):
+def is_dataframe_3d(df: pd.DataFrame) -> bool:
+    """데이터프레임에 Z 축 좌표가 존재하는지 검사하여 3D 여부 판정"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    for axes in cols_map.values():
+        if 'z' in axes:
+            return True
+    return False
+
+def get_xy_cols_2d(df: pd.DataFrame, name: str) -> np.ndarray:
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    if name in cols_map and all(a in cols_map[name] for a in ('x','y')):
+        m = cols_map[name]
+        arr = df[[m['x'], m['y']]].astype(float).to_numpy()
+        return arr
+    return np.full((len(df), 2), np.nan, dtype=float)
+
+def speed_2d(points_xy: np.ndarray, fps: Optional[int]):
+    """2D 속도 계산(px/초 또는 px/프레임)"""
+    N = len(points_xy)
+    v = np.full(N, np.nan, dtype=float)
+    for i in range(1, N):
+        a, b = points_xy[i-1], points_xy[i]
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+            continue
+        v[i] = float(np.linalg.norm(b - a))
+    unit = "px/frame"
+    if fps and fps > 0:
+        v = v * float(fps)
+        unit = "px/s"
+    v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
+    return v, unit
+
+def _pair_distance_px_series_2d(df: pd.DataFrame, joint_a: str, joint_b: str) -> np.ndarray:
+    """2D에서 두 관절 사이의 프레임별 거리(px) 시계열을 계산(보간/ffill/bfill 포함)."""
+    A = get_xy_cols_2d(df, joint_a)
+    B = get_xy_cols_2d(df, joint_b)
+    # 보간
+    for arr in (A, B):
+        for c in range(arr.shape[1]):
+            s = pd.Series(arr[:, c])
+            s = s.interpolate(limit_direction='both').fillna(method='ffill').fillna(method='bfill')
+            arr[:, c] = s.to_numpy()
+    d = np.sqrt((A[:, 0] - B[:, 0])**2 + (A[:, 1] - B[:, 1])**2)
+    return d
+
+def _get_m_per_px_from_cfg(cfg: dict, df_overlay: pd.DataFrame) -> Optional[float]:
+    """
+    analyze.yaml에서 2D 보정 스케일(m/px)을 가져오거나, 관절 쌍 캘리브레이션으로 추정.
+    지원 키:
+      - m_per_px_2d: 숫자 (예: 0.0025)
+      - calibration_2d:
+          method: "joint_pair"
+          joint_a: "LShoulder"
+          joint_b: "RShoulder"
+          real_length_m: 0.40
+    반환: m_per_px 또는 None
+    """
+    # 직접 지정이 최우선
+    mpp = cfg.get("m_per_px_2d")
+    if mpp is not None:
+        try:
+            val = float(mpp)
+            if val > 0:
+                print(f"🧭 2D 보정 스케일 직접 지정: m_per_px={val:.6f}")
+                return val
+        except Exception:
+            pass
+    calib = cfg.get("calibration_2d") or {}
+    if isinstance(calib, dict) and calib.get("method", "").lower() == "joint_pair":
+        ja = calib.get("joint_a")
+        jb = calib.get("joint_b")
+        rl = calib.get("real_length_m")
+        if ja and jb and rl is not None:
+            try:
+                real_len_m = float(rl)
+                if real_len_m <= 0:
+                    raise ValueError
+            except Exception:
+                print("⚠️ calibration_2d.real_length_m 값이 유효하지 않습니다.")
+                return None
+            d_px = _pair_distance_px_series_2d(df_overlay, ja, jb)
+            d_px_valid = d_px[np.isfinite(d_px) & (d_px > 0)]
+            if d_px_valid.size == 0:
+                print("⚠️ 캘리브레이션용 관절 쌍 거리(px)를 계산할 수 없습니다.")
+                return None
+            # 중앙값 사용(노이즈/자세 변화 완화)
+            px_med = float(np.median(d_px_valid))
+            m_per_px = real_len_m / px_med
+            print(f"🧭 2D 캘리브레이션: {ja}-{jb} median={px_med:.2f} px, real={real_len_m:.3f} m → m_per_px={m_per_px:.6f}")
+            return m_per_px
+    # 자동 캘리브레이션 (설정 없을 경우 시도)
+    auto_flag = True if calib.get("method", "").lower() in ("", "auto") else False
+    if auto_flag:
+        mpp_auto = _autocalibrate_m_per_px(df_overlay, cfg)
+        if mpp_auto is not None:
+            return mpp_auto
+    return None
+
+def _autocalibrate_m_per_px(df: pd.DataFrame, cfg: dict) -> Optional[float]:
+    """
+    피사체 신체 비율 기반의 자동 캘리브레이션.
+    - 후보 관절쌍 중 프레임 내 중앙값 픽셀거리가 크고(해상도 유리), 변동률이 낮은(원근/자세 영향 적은) 쌍을 선택.
+    - 실제 길이는 아래 우선순위를 사용:
+        1) subject.shoulder_width_m
+        2) subject.height_m * 0.259 (어깨폭 근사 비율)
+        3) 기본값 0.40 m
+    반환: m_per_px 또는 None
+    """
+    candidates = [
+        ("LShoulder", "RShoulder", "shoulder"),
+        ("LHip", "RHip", "hip"),
+        ("LAnkle", "RAnkle", "ankle")
+    ]
+    stats = []
+    for a, b, tag in candidates:
+        d = _pair_distance_px_series_2d(df, a, b)
+        valid = d[np.isfinite(d) & (d > 0)]
+        if valid.size == 0:
+            continue
+        med = float(np.median(valid))
+        # 변동률(CV) 계산 (중앙값 사용)
+        mad = float(np.median(np.abs(valid - med))) if valid.size > 0 else 0.0
+        cv = (mad / med) if med > 1e-6 else 1e9
+        stats.append((a, b, tag, med, cv))
+    if not stats:
+        return None
+    # 큰 길이(안정) + 낮은 변동률 선호: med/ cv 조합으로 정렬
+    stats.sort(key=lambda x: (-x[3], x[4]))
+    a, b, tag, px_med, cv = stats[0]
+
+    subj = cfg.get("subject") or {}
+    shoulder_w_m = subj.get("shoulder_width_m")
+    height_m = subj.get("height_m")
+    real_len_m = None
+    if shoulder_w_m is not None:
+        try:
+            real_len_m = float(shoulder_w_m)
+        except Exception:
+            real_len_m = None
+    if real_len_m is None and height_m is not None:
+        try:
+            h = float(height_m)
+            if h > 0:
+                real_len_m = 0.259 * h  # 어깨폭 근사 비율
+        except Exception:
+            pass
+    if real_len_m is None:
+        real_len_m = 0.40  # 기본 어깨폭
+
+    m_per_px = real_len_m / px_med if px_med > 0 else None
+    if m_per_px is not None:
+        print(f"🧭 2D 자동 보정: pair={a}-{b} median={px_med:.2f}px, real≈{real_len_m:.3f}m → m_per_px={m_per_px:.6f} (cv={cv:.3f})")
+    return m_per_px
+
+def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", scale_to_m: float = 1.0):
     """
     입력: 3D CSV (mm), 필수: {wrist}_X3D/Y3D/Z3D, RAnkle_X3D, LAnkle_X3D
     출력:
@@ -333,8 +489,8 @@ def analyze_wrist_speed(df: pd.DataFrame, fps: int, wrist: str = "RWrist"):
     LA = get_xyz_cols(df, 'LAnkle')     # (N,3)
     wx = W[:, 0]
     stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
-    # 3D 손목 속도 (m/s) - 좌표 단위가 'm'이라는 전제
-    v_m_s = vectorized_speed_m_s(W, fps)
+    # 3D 손목 속도 (m/s) - 좌표 단위를 scale_to_m를 통해 m로 환산
+    v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m)
     v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
     # 임팩트 프레임 탐지
     impact = detect_impact_by_crossing(wx, stance_mid_x)
@@ -365,6 +521,69 @@ def analyze_wrist_speed(df: pd.DataFrame, fps: int, wrist: str = "RWrist"):
         'club_mph_range': (club_mph_min, club_mph_max),
     }
 
+def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_per_px: Optional[float] = None):
+    """
+    입력: 2D CSV (px), 필수: {wrist}_x/{wrist}_y, RAnkle_x, LAnkle_x (있으면 사용)
+    출력:
+      - impact_frame, peak_frame
+      - 시계열 속도 v_px_s
+      - 피크 속도(손목) px/s
+    """
+    W = get_xy_cols_2d(df, wrist)        # (N,2) px
+    RA = get_xy_cols_2d(df, 'RAnkle')     # (N,2) px (없으면 NaN)
+    LA = get_xy_cols_2d(df, 'LAnkle')     # (N,2)
+    wx = W[:, 0]
+    stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
+    # 2D 손목 속도 (px/s)
+    v_px_s, unit = speed_2d(W, fps)
+    # 임팩트 프레임 탐지 (2D)
+    impact = detect_impact_by_crossing(wx, stance_mid_x)
+    # ±2 프레임 내 피크 속도
+    lo = max(0, impact - 2)
+    hi = min(len(v_px_s) - 1, impact + 2)
+    peak_local_idx = lo + int(np.nanargmax(v_px_s[lo:hi+1])) if hi >= lo else int(np.nanargmax(v_px_s))
+    peak_wrist_px_s = float(v_px_s[peak_local_idx]) if not np.isnan(v_px_s[peak_local_idx]) else float(np.nanmax(v_px_s))
+
+    # 선택적: m/px 스케일이 주어지면 m/s로 환산하여 3D와 유사한 요약 제공
+    if m_per_px is not None and m_per_px > 0:
+        v_m_s = v_px_s * float(m_per_px)
+        v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
+        peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
+        peak_wrist_mph = float(peak_wrist_kmh / 1.609344)
+        # 클럽 추정 가중치 동일 적용
+        k = 1.35
+        k_min, k_max = 1.25, 1.55
+        club_kmh = peak_wrist_kmh * k
+        club_mph = peak_wrist_mph * k
+        club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
+        club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+        return {
+            'impact_frame': int(impact),
+            'peak_frame': int(peak_local_idx),
+            'v_px_s': v_px_s,
+            'wrist_peak_px_s': peak_wrist_px_s,
+            'v_m_s': v_m_s,
+            'v_km_h': v_kmh,
+            'v_mph': v_mph,
+            'wrist_peak_kmh': peak_wrist_kmh,
+            'wrist_peak_mph': peak_wrist_mph,
+            'club_kmh': club_kmh,
+            'club_mph': club_mph,
+            'club_kmh_range': (club_kmh_min, club_kmh_max),
+            'club_mph_range': (club_mph_min, club_mph_max),
+            'unit': 'px/s',
+            'calibrated_m_per_px': float(m_per_px),
+        }
+    # 보정 불가 시 기존(px/s)만 반환
+    return {
+        'impact_frame': int(impact),
+        'peak_frame': int(peak_local_idx),
+        'v_px_s': v_px_s,
+        'wrist_peak_px_s': peak_wrist_px_s,
+        'unit': unit,
+        'calibrated_m_per_px': None,
+    }
+
 def categorize_head_speed_mph(head_mph: float):
     """주어진 클럽 헤드 속도(mph)가 어떤 집단 평균에 가장 가까운지 멘트 구성"""
     refs = [
@@ -388,6 +607,22 @@ def load_cfg(p: Path):
             raise RuntimeError("pip install pyyaml")
         return yaml.safe_load(p.read_text(encoding="utf-8"))
     raise ValueError("Use YAML for analyze config.")
+
+def _coord_scale_to_m(cfg: dict) -> float:
+    """analyze.yaml에서 coord_unit을 읽어 미터 환산 스케일을 반환합니다.
+    - 지원 단위: m, cm, mm (대소문자 무시)
+    - 기본값: m (1.0)
+    """
+    unit = (cfg.get("coord_unit", "m") or "m").strip().lower()
+    if unit in ("m", "meter", "metre", "meters"):
+        return 1.0
+    if unit in ("cm", "centimeter", "centimetre", "centimeters"):
+        return 1e-2
+    if unit in ("mm", "millimeter", "millimetre", "millimeters"):
+        return 1e-3
+    # 알 수 없는 단위면 보수적으로 1.0 (m) 처리
+    print(f"⚠️ 알 수 없는 coord_unit='{unit}', m로 간주합니다.")
+    return 1.0
 
 # =========================================================
 # Swing Speed 전용 계산 함수
@@ -591,6 +826,194 @@ def overlay_swing_video(
     writer.release()
 
 # =========================================================
+# run_from_context (프로그램적 실행 진입점)
+# =========================================================
+def run_from_context(ctx: dict):
+    """Programmatic runner for swing_speed module (2D/3D 자동 분기).
+
+    ctx(dict) 예상 키(선택적 포함):
+      - dest_dir: 출력 루트 디렉토리 (기본 '.')
+      - job_id | job: 작업 식별자 (파일 prefix)
+      - wide2: 2D DataFrame (오버레이/2D 분석용)
+      - wide3: 3D DataFrame (3D 분석용)
+      - img_dir: 프레임 이미지 디렉토리
+      - fps: 프레임 레이트 (기본 30)
+      - codec: 비디오 코덱 (기본 'mp4v')
+      - draw: {'smoothing': {...}} 2D 스무딩 옵션 (method, window, alpha 등)
+      - landmarks: {'wrist_left': 'LWrist', 'wrist_right': 'RWrist'} 커스터마이즈 가능
+      - coord_unit: 3D 좌표 단위(m|cm|mm) → 미터 환산
+      - m_per_px_2d: 2D 보정 스케일 (m/px, 직접 지정)
+      - calibration_2d: joint_pair 방식 캘리브레이션 dict
+      - subject: {'shoulder_width_m': ..., 'height_m': ...} 자동 캘리브레이션 보조
+
+    반환(dict):
+      - metrics_csv: 메트릭 CSV 경로 또는 None
+      - overlay_mp4: 스윙 오버레이 mp4 경로 또는 None
+      - summary: 핵심 수치 요약(impact_frame, peak_frame, 손목/클럽 속도 등)
+      - dimension: '2d' 또는 '3d'
+      - errors: {'metrics': str?, 'overlay': str?} 실패 시
+    """
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        if wide2 is None and wide3 is not None:
+            # 2D 대체로 3D 재사용 가능 (overlay 최소 구현 위해)
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
+        img_dir = Path(ctx.get('img_dir', dest))
+        codec = str(ctx.get('codec', 'mp4v'))
+        lm = ctx.get('landmarks', {}) or {}
+        wrist_l = lm.get('wrist_left', 'LWrist')
+        wrist_r = lm.get('wrist_right', 'RWrist')
+        ensure_dir(dest)
+
+        out = {'metrics_csv': None, 'overlay_mp4': None, 'summary': {}, 'dimension': None, 'errors': {}}
+
+        use_df = wide3 if wide3 is not None else wide2
+        if use_df is not None:
+            try:
+                dim3 = is_dataframe_3d(use_df)
+            except Exception:
+                dim3 = False
+            dimension = '3d' if dim3 else '2d'
+            out['dimension'] = dimension
+            try:
+                if dimension == '3d':
+                    # 3D 분석
+                    scale_to_m = _coord_scale_to_m(ctx)
+                    anal = analyze_wrist_speed_3d(use_df, fps=fps, wrist=wrist_r, scale_to_m=scale_to_m)
+                    # 메트릭 CSV 구성 (프레임별 m/s, km/h, mph)
+                    N = len(anal['v_m_s'])
+                    metrics_df = pd.DataFrame({
+                        'frame': range(N),
+                        'wrist_speed_m_s': anal['v_m_s'],
+                        'wrist_speed_km_h': anal['v_km_h'],
+                        'wrist_speed_mph': anal['v_mph'],
+                    })
+                    summary = {
+                        'impact_frame': int(anal['impact_frame']),
+                        'peak_frame': int(anal['peak_frame']),
+                        'wrist_peak_km_h': float(anal['wrist_peak_kmh']),
+                        'wrist_peak_mph': float(anal['wrist_peak_mph']),
+                        'club_k_factor': 1.35,
+                        'club_speed_km_h': float(anal['club_kmh']),
+                        'club_speed_mph': float(anal['club_mph']),
+                        'club_speed_km_h_range': [float(anal['club_kmh_range'][0]), float(anal['club_kmh_range'][1])],
+                        'club_speed_mph_range': [float(anal['club_mph_range'][0]), float(anal['club_mph_range'][1])],
+                    }
+                else:
+                    # 2D 분석 + 선택적 보정
+                    cfg_like = {
+                        'm_per_px_2d': ctx.get('m_per_px_2d'),
+                        'calibration_2d': ctx.get('calibration_2d'),
+                        'subject': ctx.get('subject'),
+                    }
+                    m_per_px = _get_m_per_px_from_cfg(cfg_like, wide2) if wide2 is not None else None
+                    anal = analyze_wrist_speed_2d(use_df, fps=fps, wrist=wrist_r, m_per_px=m_per_px)
+                    if anal.get('calibrated_m_per_px'):
+                        N = len(anal['v_m_s'])
+                        metrics_df = pd.DataFrame({
+                            'frame': range(N),
+                            'wrist_speed_px_s': anal['v_px_s'],
+                            'wrist_speed_m_s': anal['v_m_s'],
+                            'wrist_speed_km_h': anal['v_km_h'],
+                            'wrist_speed_mph': anal['v_mph'],
+                        })
+                        summary = {
+                            'impact_frame': int(anal['impact_frame']),
+                            'peak_frame': int(anal['peak_frame']),
+                            'wrist_peak_km_h': float(anal['wrist_peak_kmh']),
+                            'wrist_peak_mph': float(anal['wrist_peak_mph']),
+                            'club_k_factor': 1.35,
+                            'club_speed_km_h': float(anal['club_kmh']),
+                            'club_speed_mph': float(anal['club_mph']),
+                            'club_speed_km_h_range': [float(anal['club_kmh_range'][0]), float(anal['club_kmh_range'][1])],
+                            'club_speed_mph_range': [float(anal['club_mph_range'][0]), float(anal['club_mph_range'][1])],
+                            'calibrated_m_per_px': float(anal['calibrated_m_per_px']),
+                        }
+                    else:
+                        N = len(anal['v_px_s'])
+                        metrics_df = pd.DataFrame({
+                            'frame': range(N),
+                            'wrist_speed_px_s': anal['v_px_s'],
+                        })
+                        summary = {
+                            'impact_frame': int(anal['impact_frame']),
+                            'peak_frame': int(anal['peak_frame']),
+                            'wrist_peak_px_s': float(anal['wrist_peak_px_s']),
+                            'club_k_factor': 1.35,
+                            'club_speed_km_h': None,
+                            'club_speed_mph': None,
+                            'club_speed_km_h_range': [None, None],
+                            'club_speed_mph_range': [None, None],
+                            'calibrated_m_per_px': None,
+                        }
+                # CSV 저장
+                metrics_csv = dest / f"{job_id}_swing_speed_metrics.csv"
+                ensure_dir(metrics_csv.parent)
+                metrics_df.to_csv(metrics_csv, index=False)
+                out['metrics_csv'] = str(metrics_csv)
+                out['summary'] = summary
+            except Exception as e:
+                out['errors']['metrics'] = str(e)
+        else:
+            out['errors']['metrics'] = 'No DataFrame provided.'
+
+        # ----------------------
+        # Overlay 비디오 (2D 기반)
+        # ----------------------
+        overlay_path = dest / f"{job_id}_swing_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                draw_cfg = ctx.get('draw', {}) or {}
+                smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
+                if smooth_cfg.get('enabled', False):
+                    method = smooth_cfg.get('method', 'ema')
+                    window = int(smooth_cfg.get('window', 5))
+                    alpha = float(smooth_cfg.get('alpha', 0.2))
+                    gaussian_sigma = smooth_cfg.get('gaussian_sigma')
+                    hampel_sigma = smooth_cfg.get('hampel_sigma', 3.0)
+                    oneeuro_min_cutoff = smooth_cfg.get('oneeuro_min_cutoff', 1.0)
+                    oneeuro_beta = smooth_cfg.get('oneeuro_beta', 0.007)
+                    oneeuro_d_cutoff = smooth_cfg.get('oneeuro_d_cutoff', 1.0)
+                    df_overlay_sm = smooth_df_2d(
+                        wide2,
+                        prefer_2d=True,
+                        method=method,
+                        window=window,
+                        alpha=alpha,
+                        fps=fps,
+                        gaussian_sigma=gaussian_sigma,
+                        hampel_sigma=hampel_sigma,
+                        oneeuro_min_cutoff=oneeuro_min_cutoff,
+                        oneeuro_beta=oneeuro_beta,
+                        oneeuro_d_cutoff=oneeuro_d_cutoff,
+                    )
+                else:
+                    df_overlay_sm = wide2
+                overlay_swing_video(
+                    img_dir=img_dir,
+                    df=df_overlay_sm,
+                    out_mp4=overlay_path,
+                    fps=fps,
+                    codec=codec,
+                    wrist_r=wrist_r,
+                    wrist_l=wrist_l,
+                )
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            out['errors']['overlay'] = str(e)
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}
+
+# =========================================================
 # 메인 함수
 # =========================================================
 def main():
@@ -600,7 +1023,7 @@ def main():
     
     cfg = load_cfg(Path(args.config))
 
-    # CSV 분리: overlay(2D) vs metrics(3D)
+    # CSV 분리: overlay(2D) vs metrics(3D) + 상호 폴백 허용
     overlay_csv = None
     metrics_csv = None
     if "overlay_csv_path" in cfg:
@@ -624,56 +1047,47 @@ def main():
     out_csv = Path(cfg["metrics_csv"]).parent / "swing_speed_metrics.csv"
     out_mp4 = Path(cfg["overlay_mp4"]).parent / "swing_speed_analysis.mp4"
 
-    # 1) CSV 로드
-    if metrics_csv is None or not metrics_csv.exists():
-        raise RuntimeError("metrics_csv_path 가 설정되지 않았거나 파일이 존재하지 않습니다.")
-    if overlay_csv is None or not overlay_csv.exists():
-        raise RuntimeError("overlay_csv_path 가 설정되지 않았거나 파일이 존재하지 않습니다.")
-    df_metrics = pd.read_csv(metrics_csv)
-    df_overlay = pd.read_csv(overlay_csv)
-    print(f"📋 Metrics CSV 로드(swing): {metrics_csv} ({len(df_metrics)} frames)")
-    print(f"📋 Overlay CSV 로드(swing): {overlay_csv} ({len(df_overlay)} frames)")
+    # 1) CSV 로드 (서로 폴백)
+    df_metrics = None
+    df_overlay = None
+    if metrics_csv is not None and metrics_csv.exists():
+        df_metrics = pd.read_csv(metrics_csv)
+        print(f"📋 Metrics CSV 로드(swing): {metrics_csv} ({len(df_metrics)} frames)")
+    if overlay_csv is not None and overlay_csv.exists():
+        df_overlay = pd.read_csv(overlay_csv)
+        print(f"📋 Overlay CSV 로드(swing): {overlay_csv} ({len(df_overlay)} frames)")
+    # 상호 폴백
+    if df_metrics is None and df_overlay is not None:
+        print("ℹ️ metrics CSV 없음 → overlay CSV를 metrics 용도로도 사용합니다.")
+        df_metrics = df_overlay
+    if df_overlay is None and df_metrics is not None:
+        print("ℹ️ overlay CSV 없음 → metrics CSV를 overlay 용도로도 사용합니다.")
+        df_overlay = df_metrics
+    if df_metrics is None or df_overlay is None:
+        raise RuntimeError("metrics/overlay CSV를 로드할 수 없습니다. analyze.yaml을 확인하세요.")
 
-    # 2) 손목(RWrist) 기반 스윙 스피드 분석 (요청 사양)
+    # 2) 손목(RWrist) 기반 스윙 스피드 분석 (2D/3D 자동 분기)
     wrist_name = wrist_r  # 기본 Right wrist
-    anal = analyze_wrist_speed(df_metrics, fps=fps, wrist=wrist_name)
-
-    # 3) 시계열 CSV 저장 (frame, wrist_speed_m_s, km/h, mph)
-    ts_csv = out_csv.parent / "wrist_speed_timeseries.csv"
-    ts_df = pd.DataFrame({
-        'frame': np.arange(len(anal['v_m_s'])),
-        'wrist_speed_m_s': anal['v_m_s'],
-        'wrist_speed_km_h': anal['v_km_h'],
-        'wrist_speed_mph': anal['v_mph'],
-    })
-    ensure_dir(ts_csv.parent)
-    ts_df.to_csv(ts_csv, index=False)
-    print(f"✅ Wrist speed timeseries 저장: {ts_csv}")
-
-    # 4) 시각화(선택): 속도-프레임 그래프 저장
-    plot_png = out_csv.parent / "wrist_speed_plot.png"
-    if plt is not None:
-        try:
-            plt.figure(figsize=(10, 4))
-            plt.plot(ts_df['frame'], ts_df['wrist_speed_km_h'], label='Wrist Speed (km/h)', color='#1f77b4', linewidth=2)
-            # 임팩트/피크 점선
-            imp = anal['impact_frame']; pk = anal['peak_frame']
-            plt.axvline(imp, color='red', linestyle='--', linewidth=1.5, label='Impact')
-            if pk != imp:
-                plt.axvline(pk, color='gray', linestyle='--', linewidth=1.2, label='Peak')
-            plt.xlabel('Frame'); plt.ylabel('Speed (km/h)')
-            plt.title('Wrist Speed over Frames')
-            plt.legend(loc='upper right')
-            plt.tight_layout()
-            plt.savefig(plot_png, dpi=150)
-            plt.close()
-            print(f"✅ Wrist speed 그래프 저장: {plot_png}")
-        except Exception as e:
-            print(f"⚠️ 그래프 저장 실패: {e}")
+    dim = "3d" if is_dataframe_3d(df_metrics) else "2d"
+    if dim == "3d":
+        scale_to_m = _coord_scale_to_m(cfg)
+        print(f"🧭 좌표 단위 스케일: scale_to_m={scale_to_m:.6f} (m 기준)")
+        anal3d = analyze_wrist_speed_3d(df_metrics, fps=fps, wrist=wrist_name, scale_to_m=scale_to_m)
     else:
-        print("ℹ️ matplotlib 미설치: 그래프 저장은 건너뜀")
+        m_per_px = _get_m_per_px_from_cfg(cfg, df_overlay)
+        if m_per_px is not None:
+            print(f"🧭 2D 보정 사용: m_per_px={m_per_px:.6f} → px/s → m/s 변환")
+        else:
+            print("ℹ️ 2D 보정 스케일이 없어 px/s 단위로만 분석합니다. (config: m_per_px_2d 또는 calibration_2d 설정 가능)")
+        anal2d = analyze_wrist_speed_2d(df_overlay, fps=fps, wrist=wrist_name, m_per_px=m_per_px)
 
-    # 4) 비디오 오버레이
+    # 3) JSON 출력 준비 (xfactor와 동일 포맷)
+    job_id = cfg.get("job_id")
+    out_dir = Path(cfg.get("metrics_csv", metrics_csv)).parent
+    ensure_dir(out_dir)
+    out_json = out_dir / "swing_speed_metric_result.json"
+
+
     # 4) 비디오 오버레이 (2D 스무딩 적용 가능)
     draw_cfg = cfg.get('draw', {}) or {}
     smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
@@ -713,121 +1127,165 @@ def main():
     )
     print(f"✅ Swing 분석 비디오 저장: {out_mp4}")
 
-    # 5) 최종 출력 (요청된 형식)
-    wrist_peak_mph = anal['wrist_peak_mph']
-    wrist_peak_kmh = anal['wrist_peak_kmh']
-    club_mph = anal['club_mph']
-    club_kmh = anal['club_kmh']
-    club_mph_min, club_mph_max = anal['club_mph_range']
-    club_kmh_min, club_kmh_max = anal['club_kmh_range']
+    # 5) 최종 출력 (JSON 일원화, xfactor 형식 준수)
+    if dim == "3d":
+        wrist_peak_mph = anal3d['wrist_peak_mph']
+        wrist_peak_kmh = anal3d['wrist_peak_kmh']
+        club_mph = anal3d['club_mph']
+        club_kmh = anal3d['club_kmh']
+        club_mph_min, club_mph_max = anal3d['club_mph_range']
+        club_kmh_min, club_kmh_max = anal3d['club_kmh_range']
 
+        # 조언 멘트 (평균 Head Speed 표 기준)
+        advice = categorize_head_speed_mph(club_mph)
+
+        # 프레임별 시계열 구성
+        frames_obj = {}
+        N = len(anal3d['v_m_s'])
+        for i in range(N):
+            vm = float(anal3d['v_m_s'][i]) if np.isfinite(anal3d['v_m_s'][i]) else None
+            vk = float(anal3d['v_km_h'][i]) if np.isfinite(anal3d['v_km_h'][i]) else None
+            vp = float(anal3d['v_mph'][i]) if np.isfinite(anal3d['v_mph'][i]) else None
+            frames_obj[str(i)] = {
+                "wrist_speed_m_s": vm,
+                "wrist_speed_km_h": vk,
+                "wrist_speed_mph": vp,
+            }
+
+        out_obj = {
+            "job_id": job_id,
+            "dimension": "3d",
+            "metrics": {
+                "swing_speed": {
+                    "summary": {
+                        "impact_frame": int(anal3d['impact_frame']),
+                        "peak_frame": int(anal3d['peak_frame']),
+                        "wrist_peak_km_h": float(wrist_peak_kmh),
+                        "wrist_peak_mph": float(wrist_peak_mph),
+                        "club_k_factor": 1.35,
+                        "club_speed_km_h": float(club_kmh),
+                        "club_speed_mph": float(club_mph),
+                        "club_speed_km_h_range": [float(club_kmh_min), float(club_kmh_max)],
+                        "club_speed_mph_range": [float(club_mph_min), float(club_mph_max)],
+                        "swing_speed_advice": [advice],
+                        "unit": {
+                            "timeseries_main": "m/s",
+                            "timeseries_extras": ["km/h", "mph"]
+                        }
+                    },
+                    "metrics_data": {
+                        "swing_speed_timeseries": frames_obj
+                    }
+                }
+            }
+        }
+    else:
+        # 2D: 보정 여부에 따라 JSON 구성이 달라짐
+        wrist_peak_px_s = anal2d['wrist_peak_px_s']
+        N = len(anal2d['v_px_s'])
+        frames_obj = {}
+        if anal2d.get('calibrated_m_per_px'):
+            # m/s 계열 포함
+            for i in range(N):
+                vpx = float(anal2d['v_px_s'][i]) if np.isfinite(anal2d['v_px_s'][i]) else None
+                vm = float(anal2d['v_m_s'][i]) if np.isfinite(anal2d['v_m_s'][i]) else None
+                vk = float(anal2d['v_km_h'][i]) if np.isfinite(anal2d['v_km_h'][i]) else None
+                vp = float(anal2d['v_mph'][i]) if np.isfinite(anal2d['v_mph'][i]) else None
+                frames_obj[str(i)] = {
+                    "wrist_speed_px_s": vpx,
+                    "wrist_speed_m_s": vm,
+                    "wrist_speed_km_h": vk,
+                    "wrist_speed_mph": vp,
+                }
+            wrist_peak_kmh = anal2d['wrist_peak_kmh']
+            wrist_peak_mph = anal2d['wrist_peak_mph']
+            club_kmh = anal2d['club_kmh']
+            club_mph = anal2d['club_mph']
+            club_kmh_min, club_kmh_max = anal2d['club_kmh_range']
+            club_mph_min, club_mph_max = anal2d['club_mph_range']
+            advice = categorize_head_speed_mph(club_mph)
+            out_obj = {
+                "job_id": job_id,
+                "dimension": "2d",
+                "metrics": {
+                    "swing_speed": {
+                        "summary": {
+                            "impact_frame": int(anal2d['impact_frame']),
+                            "peak_frame": int(anal2d['peak_frame']),
+                            "wrist_peak_km_h": float(wrist_peak_kmh),
+                            "wrist_peak_mph": float(wrist_peak_mph),
+                            "club_k_factor": 1.35,
+                            "club_speed_km_h": float(club_kmh),
+                            "club_speed_mph": float(club_mph),
+                            "club_speed_km_h_range": [float(club_kmh_min), float(club_kmh_max)],
+                            "club_speed_mph_range": [float(club_mph_min), float(club_mph_max)],
+                            "swing_speed_advice": [advice],
+                            "unit": {
+                                "timeseries_main": "m/s",
+                                "timeseries_extras": ["km/h", "mph", "px/s"],
+                                "calibrated_m_per_px": float(anal2d['calibrated_m_per_px'])
+                            }
+                        },
+                        "metrics_data": {
+                            "swing_speed_timeseries": frames_obj
+                        }
+                    }
+                }
+            }
+        else:
+            # px/s만 제공
+            for i in range(N):
+                vpx = float(anal2d['v_px_s'][i]) if np.isfinite(anal2d['v_px_s'][i]) else None
+                frames_obj[str(i)] = {
+                    "wrist_speed_px_s": vpx,
+                    "wrist_speed_m_s": None,
+                    "wrist_speed_km_h": None,
+                    "wrist_speed_mph": None,
+                }
+            out_obj = {
+                "job_id": job_id,
+                "dimension": "2d",
+                "metrics": {
+                    "swing_speed": {
+                        "summary": {
+                            "impact_frame": int(anal2d['impact_frame']),
+                            "peak_frame": int(anal2d['peak_frame']),
+                            "wrist_peak_km_h": None,
+                            "wrist_peak_mph": None,
+                            "club_k_factor": 1.35,
+                            "club_speed_km_h": None,
+                            "club_speed_mph": None,
+                            "club_speed_km_h_range": [None, None],
+                            "club_speed_mph_range": [None, None],
+                            "swing_speed_advice": [],
+                            "unit": {
+                                "timeseries_main": "px/s",
+                                "timeseries_extras": []
+                            }
+                        },
+                        "metrics_data": {
+                            "swing_speed_timeseries": frames_obj
+                        }
+                    }
+                }
+            }
+
+    out_json.write_text(__import__('json').dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"✅ Swing Speed JSON 저장: {out_json}")
+
+    # 콘솔 요약
     print("\n결과")
-    print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph)")
-    print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
-
-    # 6) 카테고리 멘트 (평균 Head Speed 표 기준)
-    comment = categorize_head_speed_mph(club_mph)
-    print(comment)
+    if dim == "3d":
+        print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph)")
+        print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
+        print(f"📝 조언: {advice}")
+    else:
+        if anal2d.get('calibrated_m_per_px'):
+            print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph) [2D 보정]  (m_per_px={anal2d['calibrated_m_per_px']:.6f})")
+            print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
+            print(f"📝 조언: {advice}")
+        else:
+            print(f"실제 swing speed (손목) : {wrist_peak_px_s:.1f} px/s (2D, 보정 없음)")
 
 if __name__ == "__main__":
     main()
-
-
-def run_from_context(ctx: dict):
-    """Programmatic runner for swing_speed module.
-
-    ctx may provide: dest_dir, job_id, wide2 (overlay df), wide3 (metrics df), img_dir, fps, codec, draw
-
-    Returns dict with keys:
-      - metrics_csv (timeseries), overlay_mp4, summary
-    """
-    try:
-        dest = Path(ctx.get('dest_dir', '.'))
-        job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
-        fps = int(ctx.get('fps', 30))
-        wide3 = ctx.get('wide3')
-        wide2 = ctx.get('wide2')
-        # If wide2 is missing but wide3 is present (3D pipeline), allow using wide3 as fallback
-        if wide2 is None and wide3 is not None:
-            try:
-                wide2 = wide3
-            except Exception:
-                wide2 = None
-        img_dir = Path(ctx.get('img_dir', dest))
-        codec = str(ctx.get('codec', 'mp4v'))
-        ensure_dir(dest)
-
-        out = {}
-
-        # Metrics (3D) -> wrist timeseries
-        ts_csv = None
-        try:
-            if wide3 is not None:
-                wrist_r = (ctx.get('landmarks') or {}).get('wrist_right', 'RWrist')
-                anal = analyze_wrist_speed(wide3, fps=fps, wrist=wrist_r)
-                ts_df = pd.DataFrame({
-                    'frame': np.arange(len(anal['v_m_s'])),
-                    'wrist_speed_m_s': anal['v_m_s'],
-                    'wrist_speed_km_h': anal['v_km_h'],
-                    'wrist_speed_mph': anal['v_mph'],
-                })
-                ts_csv = Path(dest) / f"{job_id}_wrist_speed_timeseries.csv"
-                ensure_dir(ts_csv.parent)
-                ts_df.to_csv(ts_csv, index=False)
-                out['metrics_csv'] = str(ts_csv)
-                out['summary'] = {
-                    'impact_frame': int(anal.get('impact_frame')) if 'impact_frame' in anal else None,
-                    'peak_frame': int(anal.get('peak_frame')) if 'peak_frame' in anal else None,
-                    'wrist_peak_kmh': float(anal.get('wrist_peak_kmh')) if 'wrist_peak_kmh' in anal else None,
-                    'wrist_peak_mph': float(anal.get('wrist_peak_mph')) if 'wrist_peak_mph' in anal else None,
-                    'club_kmh': float(anal.get('club_kmh')) if 'club_kmh' in anal else None,
-                    'club_mph': float(anal.get('club_mph')) if 'club_mph' in anal else None,
-                }
-            else:
-                out['metrics_csv'] = None
-        except Exception as e:
-            out['metrics_error'] = str(e)
-
-        # Overlay (2D)
-        overlay_path = Path(dest) / f"{job_id}_swing_speed_overlay.mp4"
-        try:
-            if wide2 is not None:
-                # smoothing options
-                draw_cfg = ctx.get('draw', {}) or {}
-                smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
-                if smooth_cfg.get('enabled', False):
-                    method = smooth_cfg.get('method', 'ema')
-                    window = int(smooth_cfg.get('window', 5))
-                    alpha = float(smooth_cfg.get('alpha', 0.2))
-                    gaussian_sigma = smooth_cfg.get('gaussian_sigma')
-                    hampel_sigma = smooth_cfg.get('hampel_sigma', 3.0)
-                    oneeuro_min_cutoff = smooth_cfg.get('oneeuro_min_cutoff', 1.0)
-                    oneeuro_beta = smooth_cfg.get('oneeuro_beta', 0.007)
-                    oneeuro_d_cutoff = smooth_cfg.get('oneeuro_d_cutoff', 1.0)
-                    df_overlay_sm = smooth_df_2d(
-                        wide2,
-                        prefer_2d=True,
-                        method=method,
-                        window=window,
-                        alpha=alpha,
-                        fps=fps,
-                        gaussian_sigma=gaussian_sigma,
-                        hampel_sigma=hampel_sigma,
-                        oneeuro_min_cutoff=oneeuro_min_cutoff,
-                        oneeuro_beta=oneeuro_beta,
-                        oneeuro_d_cutoff=oneeuro_d_cutoff,
-                    )
-                else:
-                    df_overlay_sm = wide2
-
-                wrist_l = (ctx.get('landmarks') or {}).get('wrist_left', 'LWrist')
-                wrist_r = (ctx.get('landmarks') or {}).get('wrist_right', 'RWrist')
-
-                overlay_swing_video(img_dir=img_dir, df=df_overlay_sm, out_mp4=overlay_path, fps=fps, codec=codec, wrist_r=wrist_r, wrist_l=wrist_l)
-                out['overlay_mp4'] = str(overlay_path)
-        except Exception as e:
-            out.setdefault('overlay_error', str(e))
-
-        return out
-    except Exception as e:
-        return {'error': str(e)}

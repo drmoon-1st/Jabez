@@ -45,10 +45,12 @@ from utils_io import natural_key, ensure_dir
 # =========================================================
 # 공통 유틸리티/매핑 함수들 (유연한 헤더 지원)
 # =========================================================
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
+
+#다양한 헤더 규칙을 자동 인식해서 표준화된 딕셔너리를 만드는 함수. 
+def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]: 
     cols = list(columns)
     mapping: Dict[str, Dict[str, str]] = {}
-    if prefer_2d:
+    if prefer_2d: # 헤더를 자동으로 잡아냄. 
         axis_patterns = [
             ('_x', '_y', '_z'),
             ('__x', '__y', '__z'),
@@ -62,7 +64,7 @@ def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[
             ('_X', '_Y', '_Z'),
             ('_x', '_y', '_z'),
         ]
-    col_set = set(cols)
+    col_set = set(cols) # 같은 패턴 컬럼을 묶어 딕셔너리 저장.
     for col in cols:
         if col.lower() in ('frame', 'time', 'timestamp'):
             continue
@@ -80,24 +82,29 @@ def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[
                     break
     return mapping
 
-def get_xyz_cols(df: pd.DataFrame, name: str):
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+def get_xyz_cols_3d(df: pd.DataFrame, name: str):  # [3D 전용] 특정 관절의 3D 좌표 추출
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False) #헤더를 3D 기준으로 잡아냄.
     if name in cols_map and all(a in cols_map[name] for a in ('x','y','z')):
         m = cols_map[name]
         return df[[m['x'], m['y'], m['z']]].astype(float).to_numpy()
     return np.full((len(df), 3), np.nan, dtype=float)
 
-def get_xyc_row(row: pd.Series, name: str):
+def get_xyc_row_2d(row: pd.Series, name: str):  # [2D 전용] 특정 관절의 2D 좌표 추출(오버레이)
     """관절의 2D 좌표 추출 (신뢰도는 1.0 고정)"""
     cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
     x = row.get(cols_map.get(name, {}).get('x',''), np.nan)
     y = row.get(cols_map.get(name, {}).get('y',''), np.nan)
     return x, y, 1.0
 
-def speed_3d(points_xyz, fps):
+def get_xy_cols_2d(df: pd.DataFrame, name: str):  # [2D 전용] 특정 관절의 2D 좌표 시퀀스 추출
+    cmap = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    if name in cmap and all(a in cmap[name] for a in ('x', 'y')):
+        m = cmap[name]
+        return df[[m['x'], m['y']]].astype(float).to_numpy()
+    return np.full((len(df), 2), np.nan, dtype=float)
+
+def speed_3d(points_xyz, fps):  # [3D 전용] 3D 공간에서의 속도 계산
     """
-    3D 공간에서의 속도 계산
-    
     연속된 3D 좌표 포인트들 사이의 유클리드 거리를 계산하여 
     프레임당 또는 초당 이동 속도를 구합니다.
     
@@ -129,7 +136,27 @@ def speed_3d(points_xyz, fps):
     v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
     return v, unit
 
-def load_cfg(p: Path):
+def speed_2d(points_xy, fps):  # [2D 전용] 2D(픽셀) 공간에서의 속도 계산
+    """
+    2D 좌표(픽셀) 배열로부터 프레임 간 거리로 속도를 계산합니다.
+    - fps가 주어지면 px/s, 없으면 px/frame
+    """
+    N = len(points_xy)
+    v = np.full(N, np.nan, dtype=float)
+    for i in range(1, N):
+        a, b = points_xy[i-1], points_xy[i]
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+            continue
+        v[i] = float(np.linalg.norm(b - a))
+    if fps and fps > 0:
+        v = v * float(fps)
+        unit = "px/s"
+    else:
+        unit = "px/frame"
+    v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
+    return v, unit
+
+def load_cfg(p: Path): # YAML 설정 로드
     if p.suffix.lower() in (".yml", ".yaml"):
         if yaml is None:
             raise RuntimeError("pip install pyyaml")
@@ -272,7 +299,7 @@ def _first_valid_index(mask: np.ndarray) -> int:
     idx = np.where(mask)[0]
     return int(idx[0]) if idx.size > 0 else -1
 
-def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", skip_ratio: float = 0.2):
+def compute_head_movement_preimpact_3d(df: pd.DataFrame, head_joint: str = "Nose", skip_ratio: float = 0.2):  # [3D 전용]
     """
     임팩트 전 머리 움직임(프레임0 대비 Δx,Δy) 측정 및 % 정규화
 
@@ -396,7 +423,113 @@ def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", 
         'head_disp_pct': head_disp_pct,
         'selected_wrist': selected_wrist,
     }
-def compute_head_speed_3d(df: pd.DataFrame, landmark: str, fps=None):
+
+def compute_head_movement_preimpact_2d(df: pd.DataFrame, head_joint: str = "Nose", skip_ratio: float = 0.2):  # [2D 전용]
+    """
+    2D CSV(픽셀 좌표)를 대상으로 임팩트 전 머리 움직임(Δx,Δy)과 스탠스 폭 대비 %를 계산.
+    로직은 3D 버전과 동일하되 prefer_2d=True로 2D 축을 사용합니다.
+    """
+    N = len(df)
+    if N == 0:
+        return {
+            'impact_frame': -1, 'stance_width_med': np.nan, 'grade': None,
+            'disp_max_pct': np.nan, 'disp_rms_pct': np.nan,
+            'head_dx': np.array([]), 'head_dy': np.array([]), 'head_disp': np.array([]), 'head_disp_pct': np.array([]),
+            'selected_wrist': None,
+        }
+
+    nose_x = _get_axis_series(df, head_joint, 'x', prefer_2d=True).to_numpy()
+    nose_y = _get_axis_series(df, head_joint, 'y', prefer_2d=True).to_numpy()
+    la_x = _get_axis_series(df, 'LAnkle', 'x', prefer_2d=True).to_numpy()
+    ra_x = _get_axis_series(df, 'RAnkle', 'x', prefer_2d=True).to_numpy()
+    lw_x = _get_axis_series(df, 'LWrist', 'x', prefer_2d=True).to_numpy()
+    rw_x = _get_axis_series(df, 'RWrist', 'x', prefer_2d=True).to_numpy()
+
+    x0 = nose_x[0] if not np.isnan(nose_x[0]) else np.nan
+    y0 = nose_y[0] if not np.isnan(nose_y[0]) else np.nan
+    head_dx = nose_x - x0
+    head_dy = nose_y - y0
+    head_disp = np.sqrt(head_dx**2 + head_dy**2)
+
+    stance_mid_x = (ra_x + la_x) / 2.0
+    stance_width = np.abs(ra_x - la_x)
+    stance_width_med = _median_ignore_nan(stance_width)
+
+    start_slope = int(N * max(skip_ratio, 0.2))
+    start_slope = min(start_slope, max(N - 3, 0))
+    xs = np.arange(start_slope, N, dtype=float)
+    def slope_of(arr):
+        yy = arr[start_slope:]
+        if len(xs) != len(yy) or len(yy) < 2:
+            return np.nan
+        yy2 = pd.Series(yy).interpolate(limit_direction='both').to_numpy()
+        try:
+            k, b = np.polyfit(xs, yy2, 1)
+            return float(k)
+        except Exception:
+            return np.nan
+    slope_L = slope_of(lw_x)
+    slope_R = slope_of(rw_x)
+    selected_wrist = 'RWrist' if (np.nan_to_num(slope_R, nan=-1e9) >= np.nan_to_num(slope_L, nan=-1e9)) else 'LWrist'
+    wrist_x = rw_x if selected_wrist == 'RWrist' else lw_x
+
+    start = int(N * max(skip_ratio, 0.2))
+    impact = -1
+    for i in range(max(1, start), N):
+        if np.isnan(wrist_x[i]) or np.isnan(wrist_x[i-1]) or np.isnan(stance_mid_x[i]):
+            continue
+        cond_cross = wrist_x[i] >= stance_mid_x[i]
+        cond_vel = (wrist_x[i] - wrist_x[i-1]) > 0
+        if cond_cross and cond_vel:
+            impact = i
+            break
+    if impact == -1:
+        with np.errstate(invalid='ignore'):
+            impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
+
+    upto = max(min(impact, N-1), 0)
+    seg = head_disp[:upto+1]
+    if np.all(np.isnan(seg)):
+        disp_max = np.nan; disp_rms = np.nan
+    else:
+        seg2 = seg[~np.isnan(seg)]
+        disp_max = float(np.max(seg2)) if seg2.size > 0 else np.nan
+        disp_rms = float(np.sqrt(np.mean(seg2**2))) if seg2.size > 0 else np.nan
+
+    if stance_width_med and not np.isnan(stance_width_med) and stance_width_med > 0:
+        disp_max_pct = disp_max / stance_width_med * 100.0 if not np.isnan(disp_max) else np.nan
+        disp_rms_pct = disp_rms / stance_width_med * 100.0 if not np.isnan(disp_rms) else np.nan
+        head_disp_pct = head_disp / stance_width_med * 100.0
+    else:
+        disp_max_pct = np.nan; disp_rms_pct = np.nan
+        head_disp_pct = np.full_like(head_disp, np.nan, dtype=float)
+
+    def grade_of(pct):
+        if np.isnan(pct):
+            return None
+        if pct < 5:
+            return 'Excellent'
+        if pct < 10:
+            return 'Good'
+        if pct < 15:
+            return 'Caution'
+        return 'Excessive'
+    grade = grade_of(disp_max_pct)
+
+    return {
+        'impact_frame': int(impact),
+        'stance_width_med': stance_width_med,
+        'disp_max_pct': disp_max_pct,
+        'disp_rms_pct': disp_rms_pct,
+        'grade': grade,
+        'head_dx': head_dx,
+        'head_dy': head_dy,
+        'head_disp': head_disp,
+        'head_disp_pct': head_disp_pct,
+        'selected_wrist': selected_wrist,
+    }
+
+def compute_head_speed_3d(df: pd.DataFrame, landmark: str, fps=None):  # [3D 전용]
     """
     데이터프레임에서 특정 랜드마크의 Head Speed 계산
     
@@ -421,7 +554,7 @@ def compute_head_speed_3d(df: pd.DataFrame, landmark: str, fps=None):
     """
     print(f"🎯 Head Speed 계산용 관절: [{landmark}]")
     
-    pts = get_xyz_cols(df, landmark)
+    pts = get_xyz_cols_3d(df, landmark)
     head_speed, head_unit = speed_3d(pts, fps)
     
     # 머리 움직임 안정성 분석
@@ -443,6 +576,48 @@ def compute_head_speed_3d(df: pd.DataFrame, landmark: str, fps=None):
     }
     
     return pts, head_speed, head_deviations, stability_metrics, head_unit
+
+def compute_head_speed_2d(df: pd.DataFrame, landmark: str, fps=None):  # [2D 전용]
+    """
+    2D CSV(픽셀)에서 특정 랜드마크의 속도 및 안정성 지표 계산.
+    반환 단위: px/s 또는 px/frame
+    """
+    pts2 = get_xy_cols_2d(df, landmark)
+    head_speed, head_unit = speed_2d(pts2, fps)
+
+    head_deviations = []
+    for i in range(len(pts2)):
+        if i > 0 and not np.any(np.isnan(pts2[i])) and not np.any(np.isnan(pts2[i-1])):
+            deviation = np.linalg.norm(pts2[i] - pts2[i-1])
+            head_deviations.append(deviation)
+        else:
+            head_deviations.append(0.0)
+    head_deviations = np.array(head_deviations)
+
+    stability_metrics = {
+        "avg_deviation": np.mean(head_deviations) if len(head_deviations) > 0 else 0.0,
+        "max_deviation": np.max(head_deviations) if len(head_deviations) > 0 else 0.0,
+        "stability_score": 1.0 / (1.0 + np.std(head_deviations)) if len(head_deviations) > 0 else 1.0
+    }
+    return pts2, head_speed, head_deviations, stability_metrics, head_unit
+
+def is_dataframe_3d(df: pd.DataFrame) -> bool:
+    """간단 판별: 3D 컬럼(z축 포함)이 탐지되면 3D로 판단"""
+    cmap = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    for joint, axes in cmap.items():
+        if 'z' in axes:
+            return True
+    # 패턴 힌트로도 탐지
+    cols = [c.lower() for c in df.columns]
+    return any(c.endswith('x3d') or c.endswith('_z') for c in cols)
+
+def is_dataframe_2d(df: pd.DataFrame) -> bool:
+    """간단 판별: 2D x/y 페어가 있으나 z가 전혀 없으면 2D로 판단"""
+    cmap = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    has_xy = any(('x' in axes and 'y' in axes) for axes in cmap.values())
+    cmap3 = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    has_z = any(('z' in axes) for axes in cmap3.values())
+    return has_xy and not has_z
 
 def calculate_data_range(df: pd.DataFrame) -> tuple:
     """
@@ -558,7 +733,7 @@ def overlay_head_video(img_dir: Path, df: pd.DataFrame, head_points: np.ndarray,
     if len(df) > 0:
         for i in range(len(df)):
             row0 = df.iloc[i]
-            hx0, hy0, _ = get_xyc_row(row0, head_name)
+            hx0, hy0, _ = get_xyc_row_2d(row0, head_name)
             hx0, hy0 = scale_xy(hx0, hy0)
             if not (np.isnan(hx0) or np.isnan(hy0)):
                 ref_head = (int(hx0), int(hy0))
@@ -569,12 +744,12 @@ def overlay_head_video(img_dir: Path, df: pd.DataFrame, head_points: np.ndarray,
     if len(df) > 0:
         for i in range(len(df)):
             rowi = df.iloc[i]
-            lax, lay, _ = get_xyc_row(rowi, 'LAnkle')
-            rax, ray, _ = get_xyc_row(rowi, 'RAnkle')
+            lax, lay, _ = get_xyc_row_2d(rowi, 'LAnkle')
+            rax, ray, _ = get_xyc_row_2d(rowi, 'RAnkle')
             if not (np.isnan(lax) or np.isnan(rax)):
                 mid_x_raw = (float(lax) + float(rax)) / 2.0
                 # y는 스케일 함수 요구사항 때문에 전달 (정규화 스케일 시 필요)
-                hxi, hyi, _ = get_xyc_row(rowi, head_name)
+                hxi, hyi, _ = get_xyc_row_2d(rowi, head_name)
                 y_ref = hyi if not np.isnan(hyi) else (lay if not np.isnan(lay) else (ray if not np.isnan(ray) else 0.0))
                 mid_x_scaled, _ = scale_xy(mid_x_raw, y_ref)
                 if not np.isnan(mid_x_scaled):
@@ -599,7 +774,7 @@ def overlay_head_video(img_dir: Path, df: pd.DataFrame, head_points: np.ndarray,
             cv2.circle(frame, ref_head, 35, (0, 0, 255), 2)  # 빨간색 빈 원(두께 2)
 
         # --- Nose 궤적(파란색) ---
-        hx, hy, _ = get_xyc_row(row, head_name)
+        hx, hy, _ = get_xyc_row_2d(row, head_name)
         hx, hy = scale_xy(hx, hy)
         if not (np.isnan(hx) or np.isnan(hy)):
             pt = (int(hx), int(hy))
@@ -634,6 +809,182 @@ def overlay_head_video(img_dir: Path, df: pd.DataFrame, head_points: np.ndarray,
     writer.release()
 
 # =========================================================
+# run_from_context (프로그램적 실행 진입점)
+# =========================================================
+def run_from_context(ctx: dict):
+    """Programmatic runner for head_speed module (2D/3D 자동 분기).
+
+    ctx(dict)에서 사용하는(선택적) 키:
+      - dest_dir: 출력 저장 루트 디렉토리
+      - job_id | job: 출력 파일명 prefix 용 ID
+      - wide2: 2D(오버레이)용 DataFrame
+      - wide3: 3D(메트릭)용 DataFrame
+      - img_dir: 프레임 이미지 디렉토리(오버레이 렌더링용)
+      - fps: 프레임 레이트 (기본 30)
+      - codec: 비디오 코덱 (기본 'mp4v')
+      - draw: {'smoothing': {...}} 스무딩 옵션
+
+    반환(dict) JSON 직렬화 가능:
+      - metrics_csv: 메트릭 CSV 경로 또는 None
+      - overlay_mp4: 오버레이 mp4 경로 또는 None
+      - summary: 핵심 수치 요약(impact_frame, disp%, head speed 등)
+      - metrics_error / overlay_error: 오류 발생 시 에러 문자열
+    """
+    try:
+        dest = Path(ctx.get('dest_dir', '.'))
+        job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
+        fps = int(ctx.get('fps', 30))
+        wide3 = ctx.get('wide3')  # 3D 데이터프레임
+        wide2 = ctx.get('wide2')  # 2D 데이터프레임 (오버레이)
+        # wide2 없고 wide3 있으면 2D 대체 용도로 wide3 재사용 시도
+        if wide2 is None and wide3 is not None:
+            try:
+                wide2 = wide3
+            except Exception:
+                wide2 = None
+        img_dir = Path(ctx.get('img_dir', dest))
+        codec = str(ctx.get('codec', 'mp4v'))
+        ensure_dir(dest)
+
+        out: dict = {}
+
+        # ----------------------
+        # Metrics 계산 (3D 우선, 없다면 2D)
+        # ----------------------
+        use_df = wide3 if wide3 is not None else wide2
+        if use_df is not None:
+            try:
+                use_3d = is_dataframe_3d(use_df)
+            except Exception:
+                use_3d = False
+
+            try:
+                if use_3d:
+                    pre = compute_head_movement_preimpact_3d(use_df, head_joint='Nose', skip_ratio=0.2)
+                    pts, head_speed_arr, head_deviations, stability_metrics, head_unit = compute_head_speed_3d(use_df, landmark='Nose', fps=fps)
+                else:
+                    pre = compute_head_movement_preimpact_2d(use_df, head_joint='Nose', skip_ratio=0.2)
+                    pts2, head_speed_arr, head_deviations, stability_metrics, head_unit = compute_head_speed_2d(use_df, landmark='Nose', fps=fps)
+                    # 2D 패딩하여 (N,3) 형태 맞춤
+                    pts = np.hstack([pts2, np.zeros((len(pts2), 1))]) if len(pts2) > 0 else np.zeros((len(use_df), 3))
+            except Exception as e:
+                return {'error': f'head_speed metrics failure: {e}'}
+
+            try:
+                # 메트릭 CSV 생성 (보수적 컬럼 구성)
+                N = len(use_df)
+                prefer_2d = not use_3d
+                nose_x = _get_axis_series(use_df, 'Nose', 'x', prefer_2d=prefer_2d)
+                nose_y = _get_axis_series(use_df, 'Nose', 'y', prefer_2d=prefer_2d)
+                nose_z = _get_axis_series(use_df, 'Nose', 'z', prefer_2d=False)
+
+                lw_x = _get_axis_series(use_df, 'LWrist', 'x', prefer_2d=prefer_2d)
+                lw_y = _get_axis_series(use_df, 'LWrist', 'y', prefer_2d=prefer_2d)
+                lw_z = _get_axis_series(use_df, 'LWrist', 'z', prefer_2d=False)
+                rw_x = _get_axis_series(use_df, 'RWrist', 'x', prefer_2d=prefer_2d)
+                rw_y = _get_axis_series(use_df, 'RWrist', 'y', prefer_2d=prefer_2d)
+                rw_z = _get_axis_series(use_df, 'RWrist', 'z', prefer_2d=False)
+
+                metrics_df = pd.DataFrame({
+                    'frame': list(range(N)),
+                    'nose_x': nose_x,
+                    'nose_y': nose_y,
+                    'nose_z': nose_z,
+                    'lwrist_x': lw_x,
+                    'lwrist_y': lw_y,
+                    'lwrist_z': lw_z,
+                    'rwrist_x': rw_x,
+                    'rwrist_y': rw_y,
+                    'rwrist_z': rw_z,
+                    'head_dx_addr': pre['head_dx'] if pre is not None else np.full(N, np.nan),
+                    'head_dy_addr': pre['head_dy'] if pre is not None else np.full(N, np.nan),
+                    'head_disp_addr': pre['head_disp'] if pre is not None else np.full(N, np.nan),
+                    'head_disp_pct': pre['head_disp_pct'] if pre is not None else np.full(N, np.nan),
+                })
+
+                metrics_csv = dest / f"{job_id}_head_speed_metrics.csv"
+                ensure_dir(metrics_csv.parent)
+                metrics_df.to_csv(metrics_csv, index=False)
+                out['metrics_csv'] = str(metrics_csv)
+                out['summary'] = {
+                    'impact_frame': int(pre['impact_frame']) if pre is not None and 'impact_frame' in pre else None,
+                    'disp_max_pct': float(pre['disp_max_pct']) if pre is not None and not np.isnan(pre.get('disp_max_pct', np.nan)) else None,
+                    'disp_rms_pct': float(pre['disp_rms_pct']) if pre is not None and not np.isnan(pre.get('disp_rms_pct', np.nan)) else None,
+                    'grade': pre.get('grade') if pre is not None else None,
+                    'mean_head_speed': float(np.nanmean(head_speed_arr)) if len(head_speed_arr) > 0 else None,
+                    'max_head_speed': float(np.nanmax(head_speed_arr)) if len(head_speed_arr) > 0 else None,
+                    'unit': head_unit,
+                }
+            except Exception as e:
+                out['metrics_error'] = str(e)
+        else:
+            out['metrics_csv'] = None
+
+        # ----------------------
+        # Overlay 비디오 (2D 기반)
+        # ----------------------
+        overlay_path = dest / f"{job_id}_head_speed_overlay.mp4"
+        try:
+            if wide2 is not None:
+                draw_cfg = ctx.get('draw', {}) or {}
+                smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
+                if smooth_cfg.get('enabled', False):
+                    method = smooth_cfg.get('method', 'ema')
+                    window = int(smooth_cfg.get('window', 5))
+                    alpha = float(smooth_cfg.get('alpha', 0.2))
+                    gaussian_sigma = smooth_cfg.get('gaussian_sigma')
+                    hampel_sigma = smooth_cfg.get('hampel_sigma', 3.0)
+                    oneeuro_min_cutoff = smooth_cfg.get('oneeuro_min_cutoff', 1.0)
+                    oneeuro_beta = smooth_cfg.get('oneeuro_beta', 0.007)
+                    oneeuro_d_cutoff = smooth_cfg.get('oneeuro_d_cutoff', 1.0)
+                    df_overlay_sm = smooth_df_2d(
+                        wide2,
+                        prefer_2d=True,
+                        method=method,
+                        window=window,
+                        alpha=alpha,
+                        fps=fps,
+                        gaussian_sigma=gaussian_sigma,
+                        hampel_sigma=hampel_sigma,
+                        oneeuro_min_cutoff=oneeuro_min_cutoff,
+                        oneeuro_beta=oneeuro_beta,
+                        oneeuro_d_cutoff=oneeuro_d_cutoff,
+                    )
+                else:
+                    df_overlay_sm = wide2
+
+                # Head 포인트 계산 (2D 또는 3D)
+                try:
+                    if wide3 is not None and is_dataframe_3d(wide3):
+                        head_pts, _, _, _, _ = compute_head_speed_3d(wide3, landmark='Nose', fps=fps)
+                    else:
+                        pts2, _, _, _, _ = compute_head_speed_2d(df_overlay_sm, landmark='Nose', fps=fps)
+                        head_pts = np.hstack([pts2, np.zeros((len(pts2), 1))]) if len(pts2) > 0 else np.zeros((len(df_overlay_sm), 3))
+                except Exception:
+                    head_pts = np.zeros((len(df_overlay_sm), 3))
+
+                overlay_head_video(
+                    img_dir,
+                    df_overlay_sm,
+                    head_pts,
+                    out.get('summary', {}).get('mean_head_speed', np.zeros(len(df_overlay_sm))),
+                    out.get('summary', {}).get('mean_head_speed', np.zeros(len(df_overlay_sm))),
+                    out.get('summary', {}) or {},
+                    out.get('summary', {}).get('unit', 'mm/frame'),
+                    'Nose',
+                    overlay_path,
+                    fps,
+                    codec,
+                )
+                out['overlay_mp4'] = str(overlay_path)
+        except Exception as e:
+            out.setdefault('overlay_error', str(e))
+
+        return out
+    except Exception as e:
+        return {'error': str(e)}
+
+# =========================================================
 # 메인 함수
 # =========================================================
 def main():
@@ -643,17 +994,17 @@ def main():
     
     cfg = load_cfg(Path(args.config))
 
-    # CSV 분리: overlay(2D) vs metrics(3D)
+    # CSV 분리: overlay(2D) vs metrics(3D) 또는 단일 경로 자동 판별
     overlay_csv = None
     metrics_csv = None
+    single_csv = None
     if "overlay_csv_path" in cfg:
         overlay_csv = Path(cfg["overlay_csv_path"]); print(f"📊 Overlay(2D) CSV 사용(head): {overlay_csv}")
     elif "csv_path" in cfg:
-        overlay_csv = Path(cfg["csv_path"]); print(f"📊 Overlay(2D) CSV (fallback)(head): {overlay_csv}")
+        # 단일 경로로 전달된 경우 (2D/3D 자동 판별)
+        single_csv = Path(cfg["csv_path"]); print(f"📊 단일 CSV 경로(head): {single_csv}")
     if "metrics_csv_path" in cfg:
         metrics_csv = Path(cfg["metrics_csv_path"]); print(f"📊 Metrics(3D) CSV 사용(head): {metrics_csv}")
-    elif "csv_path" in cfg:
-        metrics_csv = Path(cfg["csv_path"]); print(f"📊 Metrics(3D) CSV (fallback)(head): {metrics_csv}")
     img_dir = Path(cfg["img_dir"])
     fps = int(cfg.get("fps", 30))
     codec = str(cfg.get("codec", "mp4v"))
@@ -663,61 +1014,152 @@ def main():
     head_name = lm_cfg.get("head", "Nose")
     
     # 출력 경로 (Head 전용)
-    out_csv = Path(cfg["metrics_csv"]).parent / "head_speed_metrics.csv"
-    out_mp4 = Path(cfg["overlay_mp4"]).parent / "head_speed_analysis.mp4"
+    # 주의: 2D/3D 분기 이후에 JSON/MP4 출력 경로를 결정합니다.
 
-    # 1) CSV 로드
-    if metrics_csv is None or not metrics_csv.exists():
-        raise RuntimeError("metrics_csv_path 가 설정되지 않았거나 파일이 존재하지 않습니다.")
-    if overlay_csv is None or not overlay_csv.exists():
-        raise RuntimeError("overlay_csv_path 가 설정되지 않았거나 파일이 존재하지 않습니다.")
-    df_metrics = pd.read_csv(metrics_csv)
-    df_overlay = pd.read_csv(overlay_csv)
-    # 입력 크기 등 불필요 로그 제거
+    # 1) CSV 로드 및 차원 판별
+    df_overlay = None
+    df_metrics = None
+    mode = None  # '2d' | '3d'
+    if metrics_csv and metrics_csv.exists():
+        df_metrics = pd.read_csv(metrics_csv)
+        if is_dataframe_3d(df_metrics):
+            mode = '3d'
+        elif is_dataframe_2d(df_metrics):
+            # metrics_csv가 실제로는 2D인 경우 (유연성)
+            mode = '2d'
+            df_overlay = df_metrics.copy()
+    if mode is None:
+        # metrics 기반으로 못 정하면 overlay로 시도
+        if overlay_csv and overlay_csv.exists():
+            df_overlay = pd.read_csv(overlay_csv)
+            mode = '2d' if is_dataframe_2d(df_overlay) else ('3d' if is_dataframe_3d(df_overlay) else None)
+        elif single_csv and single_csv.exists():
+            df_any = pd.read_csv(single_csv)
+            if is_dataframe_3d(df_any):
+                mode = '3d'; df_metrics = df_any
+            elif is_dataframe_2d(df_any):
+                mode = '2d'; df_overlay = df_any
+    if mode is None:
+        raise RuntimeError("CSV 차원(2D/3D) 판별 실패: 컬럼 헤더를 확인하세요.")
 
-    # 2) 임팩트 전 머리 움직임(%) 계산 (요청 사양)
-    pre = compute_head_movement_preimpact(df_metrics, head_name, skip_ratio=0.2)
+    # 2) 메트릭 계산 및 JSON 출력
+    job_id = cfg.get("job_id")
+    if mode == '3d':
+        if df_metrics is None:
+            if metrics_csv and metrics_csv.exists():
+                df_metrics = pd.read_csv(metrics_csv)
+            else:
+                raise RuntimeError("3D 모드에 metrics_csv 가 필요합니다.")
+        pre = compute_head_movement_preimpact_3d(df_metrics, head_name, skip_ratio=0.2)
+        head_pts, head_speed, head_deviations, stability_metrics, head_unit = compute_head_speed_3d(df_metrics, head_name, fps)
+        N = len(df_metrics)
+        out_dir = Path(cfg.get("metrics_csv", metrics_csv)).parent
+        ensure_dir(out_dir)
+        out_json = out_dir / "head_speed_metric_result.json"
+        frames_obj = {}
+        head_disp_pct = pre['head_disp_pct'] if isinstance(pre.get('head_disp_pct'), np.ndarray) else np.full((N,), np.nan)
+        for i in range(N):
+            v_speed = float(head_speed[i]) if i < len(head_speed) and np.isfinite(head_speed[i]) else None
+            v_disp_pct = float(head_disp_pct[i]) if i < len(head_disp_pct) and np.isfinite(head_disp_pct[i]) else None
+            frames_obj[str(i)] = {
+                "head_speed": v_speed,
+                "head_disp_pct": v_disp_pct,
+            }
+        mean_head_speed = float(np.nanmean(head_speed)) if len(head_speed) else None
+        max_head_speed = float(np.nanmax(head_speed)) if len(head_speed) else None
+        out_obj = {
+            "job_id": job_id,
+            "dimension": "3d",
+            "metrics": {
+                "head_speed": {
+                    "summary": {
+                        "impact_frame": int(pre['impact_frame']),
+                        "selected_wrist": pre['selected_wrist'],
+                        "stance_width_median": float(pre['stance_width_med']) if pre['stance_width_med'] is not None else None,
+                        "disp_max_pct": float(pre['disp_max_pct']) if pre['disp_max_pct'] is not None else None,
+                        "disp_rms_pct": float(pre['disp_rms_pct']) if pre['disp_rms_pct'] is not None else None,
+                        "grade": pre['grade'],
+                        "mean_head_speed": mean_head_speed,
+                        "max_head_speed": max_head_speed,
+                        "unit": {
+                            "timeseries_main": "mm/s",
+                            "timeseries_extras": ["%"]
+                        }
+                    },
+                    "metrics_data": {
+                        "head_speed_timeseries": frames_obj
+                    }
+                }
+            }
+        }
+        Path(out_json).write_text(__import__('json').dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"✅ Head Speed JSON 저장(3D): {out_json}")
+        # 오버레이 준비용 2D 프레임 로드
+        if df_overlay is None:
+            if overlay_csv and overlay_csv.exists():
+                df_overlay = pd.read_csv(overlay_csv)
+            else:
+                df_overlay = df_metrics  # 3D를 2D 오버레이로 사용 시도
+    else:  # mode == '2d'
+        if df_overlay is None:
+            if overlay_csv and overlay_csv.exists():
+                df_overlay = pd.read_csv(overlay_csv)
+            elif single_csv and single_csv.exists():
+                df_overlay = pd.read_csv(single_csv)
+            else:
+                raise RuntimeError("2D 모드에 overlay CSV 가 필요합니다.")
+        pre = compute_head_movement_preimpact_2d(df_overlay, head_name, skip_ratio=0.2)
+        head_pts, head_speed, head_deviations, stability_metrics, head_unit = compute_head_speed_2d(df_overlay, head_name, fps)
+        N = len(df_overlay)
+        # 2D 모드에서도 metrics 출력 디렉터리는 overlay_csv 기준으로 결정
+        base_csv = cfg.get("metrics_csv", cfg.get("overlay_csv_path", cfg.get("csv_path", overlay_csv)))
+        out_dir = Path(base_csv).parent if base_csv is not None else Path(".")
+        ensure_dir(out_dir)
+        out_json = out_dir / "head_speed_metric_result.json"
+        frames_obj = {}
+        head_disp_pct = pre['head_disp_pct'] if isinstance(pre.get('head_disp_pct'), np.ndarray) else np.full((N,), np.nan)
+        for i in range(N):
+            v_speed = float(head_speed[i]) if i < len(head_speed) and np.isfinite(head_speed[i]) else None
+            v_disp_pct = float(head_disp_pct[i]) if i < len(head_disp_pct) and np.isfinite(head_disp_pct[i]) else None
+            frames_obj[str(i)] = {
+                "head_speed": v_speed,
+                "head_disp_pct": v_disp_pct,
+            }
+        mean_head_speed = float(np.nanmean(head_speed)) if len(head_speed) else None
+        max_head_speed = float(np.nanmax(head_speed)) if len(head_speed) else None
+        out_obj = {
+            "job_id": job_id,
+            "dimension": "2d",
+            "metrics": {
+                "head_speed": {
+                    "summary": {
+                        "impact_frame": int(pre['impact_frame']),
+                        "selected_wrist": pre['selected_wrist'],
+                        "stance_width_median": float(pre['stance_width_med']) if pre['stance_width_med'] is not None else None,
+                        "disp_max_pct": float(pre['disp_max_pct']) if pre['disp_max_pct'] is not None else None,
+                        "disp_rms_pct": float(pre['disp_rms_pct']) if pre['disp_rms_pct'] is not None else None,
+                        "grade": pre['grade'],
+                        "mean_head_speed": mean_head_speed,
+                        "max_head_speed": max_head_speed,
+                        "unit": {
+                            "timeseries_main": head_unit,  # px/s 또는 px/frame
+                            "timeseries_extras": ["%"]
+                        }
+                    },
+                    "metrics_data": {
+                        "head_speed_timeseries": frames_obj
+                    }
+                }
+            }
+        }
+        Path(out_json).write_text(__import__('json').dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"✅ Head Speed JSON 저장(2D): {out_json}")
 
-    # 3) 결과 저장: 요청된 컬럼만 저장
-    N = len(df_metrics)
-    nose_x = _get_axis_series(df_metrics, head_name, 'x', prefer_2d=False)
-    nose_y = _get_axis_series(df_metrics, head_name, 'y', prefer_2d=False)
-    nose_z = _get_axis_series(df_metrics, head_name, 'z', prefer_2d=False)
-    lw_x = _get_axis_series(df_metrics, 'LWrist', 'x', prefer_2d=False)
-    lw_y = _get_axis_series(df_metrics, 'LWrist', 'y', prefer_2d=False)
-    lw_z = _get_axis_series(df_metrics, 'LWrist', 'z', prefer_2d=False)
-    rw_x = _get_axis_series(df_metrics, 'RWrist', 'x', prefer_2d=False)
-    rw_y = _get_axis_series(df_metrics, 'RWrist', 'y', prefer_2d=False)
-    rw_z = _get_axis_series(df_metrics, 'RWrist', 'z', prefer_2d=False)
-
-    metrics = pd.DataFrame({
-        'frame': range(N),
-        # 머리(Nose) 좌표
-        'nose_x': nose_x,
-        'nose_y': nose_y,
-        'nose_z': nose_z,
-        # 손목 좌표 (좌/우)
-        'lwrist_x': lw_x,
-        'lwrist_y': lw_y,
-        'lwrist_z': lw_z,
-        'rwrist_x': rw_x,
-        'rwrist_y': rw_y,
-        'rwrist_z': rw_z,
-        # 프레임별 변위 값들 (어드레스 대비)
-        'head_dx_addr': pre['head_dx'],
-        'head_dy_addr': pre['head_dy'],
-        'head_disp_addr': pre['head_disp'],
-        'head_disp_pct': pre['head_disp_pct'],
-    })
-    
-    ensure_dir(out_csv.parent)
-    metrics.to_csv(out_csv, index=False)
-    # 저장 로그 출력 생략 (요청에 따라 콘솔은 최소화)
-
-    # 4) 비디오 오버레이 (이전 동작 유지)
-    # 2D 스무딩 적용 가능
+    # 3) 비디오 오버레이 (2D 데이터 필요)
     draw_cfg = cfg.get('draw', {}) or {}
     smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
+    if df_overlay is None:
+        raise RuntimeError("오버레이용 2D DataFrame이 없습니다. overlay_csv 설정을 확인하세요.")
     if smooth_cfg.get('enabled', False):
         method = smooth_cfg.get('method', 'ema')
         window = int(smooth_cfg.get('window', 5))
@@ -743,8 +1185,12 @@ def main():
     else:
         df_overlay_sm = df_overlay
 
-    # 오버레이에 필요한 최소 메트릭 계산(함수 시그니처 충족)
-    head_pts, head_speed, head_deviations, stability_metrics, head_unit = compute_head_speed_3d(df_metrics, head_name, fps)
+    # 오버레이 출력 경로
+    if "overlay_mp4" in cfg:
+        out_mp4 = Path(cfg["overlay_mp4"]).parent / "head_speed_analysis.mp4"
+    else:
+        base_for_overlay = cfg.get("overlay_csv_path", cfg.get("csv_path", "."))
+        out_mp4 = Path(base_for_overlay).parent / "head_speed_analysis.mp4"
     overlay_head_video(img_dir, df_overlay_sm, head_pts, head_speed, head_deviations,
                        stability_metrics, head_unit, head_name, out_mp4, fps, codec)
     

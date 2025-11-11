@@ -1,22 +1,3 @@
-"""
-Controller (OpenPose + Metrics Orchestrator)
-===========================================
-
-이 모듈은 다음을 수행합니다.
-- 입력(2D: mp4, 3D: zip)을 S3에서 다운로드하여 /tmp 하위에서 처리
-- OpenPose로 포즈 키포인트 추출 → 프레임별 JSON/이미지 생성 → DataFrame 구성(df_2d/df_3d)
-- 메트릭 러너(metric_algorithm)를 호출해 각 메트릭을 실행하고 산출물(csv/mp4/summary)을 수집
-- 최종 결과 JSON(<job_id>.json)을 저장하고, 산출물 디렉터리(csv/, mp4/, img/, openpose_img/)를 정리
-
-환경 변수
-- 입력 버킷: S3_VIDEO_BUCKET_NAME 또는 S3_BUCKET/AWS_S3_BUCKET
-- 결과 버킷: S3_RESULT_BUCKET_NAME 또는 RESULT_S3_BUCKET
-
-주의
-- 본 파일은 openpose 패키지 경로가 PYTHONPATH에 잡혀 있어야 합니다
-    (예: .../golf/containers/skeleton_metric-api 가 sys.path에 포함되어야 openpose 임포트 가능).
-"""
-
 import traceback
 import json
 import os
@@ -35,58 +16,41 @@ from openpose.openpose import run_openpose_on_video, run_openpose_on_dir, _sanit
 
 
 def run_metrics_in_process(dimension: str, ctx: dict):
-    """메트릭 실행 훅.
+    """Placeholder hook to run in-process metric calculations.
 
-    Parameters
-    ----------
-    dimension : str
-        '2d' 또는 '3d'. 결과 JSON이나 메트릭 내부 로직에서 필요.
-    ctx : dict
-        `process_and_save` 함수의 locals()를 기반으로 한 문맥. 여기에는
-        df_2d / df_3d (존재 시), people_sequence, dest_dir, job_id 등이 포함.
-
-    Behavior
-    --------
-    - `metric_algorithm.run_metrics_from_context` 를 찾아 실행합니다.
-    - 메트릭 모듈/실행 실패는 전체 파이프라인을 멈추지 않고 None 반환.
-
-    Returns
-    -------
-    dict | None
-        메트릭 실행 결과(모듈별 딕셔너리) 또는 실패 시 None.
+    `ctx` contains local variables including df_2d or df_3d (if produced) and people_sequence.
+    This function intentionally does not raise; it's a no-op extension point for downstream algorithms.
     """
     try:
+        # Attempt to call the packaged metric runner which expects the local context
+        # (df_2d/df_3d, people_sequence, etc.), plus dest_dir and job_id if present.
+        # We intentionally guard this call so metric failures don't break processing.
         try:
             from metric_algorithm import run_metrics_from_context
         except Exception:
+            # metric package not available
             traceback.print_exc()
             return None
 
+        # ctx is typically locals() from process_and_save; try to locate dest_dir and job_id
         dest_dir = ctx.get('dest_dir') or ctx.get('dest') or None
         job_id = ctx.get('job_id') or ctx.get('job') or None
 
+        # Ensure strings
         if dest_dir is None or job_id is None:
+            # If missing, don't fail - just call runner with placeholders
             try:
-                res = run_metrics_from_context(
-                    ctx,
-                    dest_dir=str(dest_dir) if dest_dir is not None else '.',
-                    job_id=str(job_id) if job_id is not None else 'unknown',
-                    dimension=dimension,
-                )
+                res = run_metrics_from_context(ctx, dest_dir=str(dest_dir) if dest_dir is not None else '.', job_id=str(job_id) if job_id is not None else 'unknown', dimension=dimension)
             except Exception:
                 traceback.print_exc()
                 return None
         else:
             try:
-                res = run_metrics_from_context(
-                    ctx,
-                    dest_dir=str(dest_dir),
-                    job_id=str(job_id),
-                    dimension=dimension,
-                )
+                res = run_metrics_from_context(ctx, dest_dir=str(dest_dir), job_id=str(job_id), dimension=dimension)
             except Exception:
                 traceback.print_exc()
                 return None
+
         return res
     except Exception:
         traceback.print_exc()
@@ -94,32 +58,17 @@ def run_metrics_in_process(dimension: str, ctx: dict):
 
 
 def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_skeleton: bool, dest_dir: Path):
-    """입력 다운로드 → OpenPose 실행 → 보간 → 결과 저장(+메트릭 실행)까지 전체 파이프라인.
+    """Download input from S3 using s3_key, run OpenPose (or parse files) depending on dimension (2d/3d),
+    interpolate sequence and save results to dest_dir/<job_id>.json.
 
-    매개변수
-    - s3_key: 입력 객체 키(2D: mp4, 3D: zip)
-    - dimension: '2d' | '3d'
-    - job_id: 산출물 파일명 접두에 쓰일 식별자
-    - turbo_without_skeleton: (예약) skeleton 추출 스킵 플래그. 현재 로직에서는 사용하지 않음.
-    - dest_dir: 산출물 저장 디렉터리 경로
-
-    처리 개요
-    1) S3에서 입력 다운로드 (/tmp 하위 작업 디렉터리 사용)
-    2) 2D: mp4 → run_openpose_on_video → 프레임별 JSON 파싱 → df_2d 생성 → 원본 프레임 추출(img/)
-       3D: zip → color/, depth/ 추출 → run_openpose_on_dir(color/) → 깊이 샘플링으로 Z 추정 → intrinsics로 X/Y 계산 → df_3d 생성
-    3) interpolate_sequence로 people_sequence 생성(프레임별 첫 번째 사람 기준)
-    4) <job_id>.json 저장 + OpenPose 렌더 이미지 openpose_img/ 보존
-    5) run_metrics_in_process로 메트릭 실행 → 결과(csv, overlay mp4, summary 등)를 job json에 병합
-    6) 산출물 정리(csv/, mp4/ 하위로 이동) 후 job json 경로 업데이트
-
-    반환
-    - response_payload(dict): message, people_sequence, frame_count, skeleton_rows/columns 등 포함
+    Expects an environment variable `S3_BUCKET` or `AWS_S3_BUCKET` to be set. This function is intended to run in a
+    background worker (non-blocking for API).
     """
     try:
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        # 입력 버킷을 환경변수에서 결정합니다.
+        # determine input bucket from environment
         bucket = os.environ.get('S3_VIDEO_BUCKET_NAME') or os.environ.get('S3_BUCKET') or os.environ.get('AWS_S3_BUCKET')
         if not bucket:
             raise RuntimeError('S3_VIDEO_BUCKET_NAME (or S3_BUCKET/AWS_S3_BUCKET) environment variable is not set')
@@ -127,8 +76,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         s3 = boto3.client('s3')
         key = s3_key.lstrip('/')
 
-        # /tmp 하위에 작업 디렉터리를 만들고(컨테이너 친화적), 디버깅을 위해 자동 삭제하지 않습니다.
-        # 운영 환경에서는 정리 정책/주기를 고려하세요.
+        # Use /tmp for temporary work (Docker-friendly).
+        # For debugging, create a persistent tmp dir (mkdtemp) so files are not auto-deleted.
+        # NOTE: this is intentionally persistent for debugging; remember to clean up manually.
         tmpdir = tempfile.mkdtemp(dir='/tmp')
         tmp_dir = Path(tmpdir)
         # If you later want automatic cleanup, replace above with:
@@ -141,13 +91,13 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
         result_by_frame = []
 
-        if dimension == '2d':  # --- 2D 처리 경로 ---
+        if dimension == '2d':
             # download mp4 and run openpose on video
             local_video = tmp_dir / 'input.mp4'
             s3.download_file(bucket, key, str(local_video))
             run_openpose_on_video(str(local_video), str(output_json_dir), str(output_img_dir))
 
-            # OpenPose 결과(JSON)를 파싱하여 프레임/사람/관절 단위의 tidy(long) DataFrame(df_2d)을 생성합니다.
+            # parse JSON outputs (sorted by filename) and build an in-memory pandas DataFrame (long/tidy)
             json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
             rows = []  # rows for DataFrame
             for frame_idx, jp in enumerate(json_paths):
@@ -176,38 +126,12 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         })
 
             df_2d = pd.DataFrame(rows)
-            # 원본 RGB 프레임을 dest_dir/img로 추출하여 메트릭 오버레이가 실제 프레임에 그려지도록 합니다.
-            try:
-                dest_img_dir = Path(dest_dir) / 'img'
-                dest_img_dir.mkdir(parents=True, exist_ok=True)
-                if 'local_video' in locals() and Path(local_video).exists():
-                    try:
-                        import cv2 as _cv2
-                        cap = _cv2.VideoCapture(str(local_video))
-                        idx = 0
-                        while True:
-                            ret, frame = cap.read()
-                            if not ret:
-                                break
-                            outp = dest_img_dir / f"{idx:06d}.png"
-                            try:
-                                _cv2.imwrite(str(outp), frame)
-                            except Exception:
-                                pass
-                            idx += 1
-                        cap.release()
-                    except Exception:
-                        # If OpenCV not available or extraction fails, fall back to copying
-                        # OpenPose rendered images later (there is a fallback further down).
-                        pass
-            except Exception:
-                pass
-        elif dimension == '3d':  # --- 3D 처리 경로 ---
+        elif dimension == '3d':
                 # download zip and extract expected color/ and depth/ folders
                 local_zip = tmp_dir / 'input.zip'
                 s3.download_file(bucket, key, str(local_zip))
 
-                # 안전한 압축 해제(zip-slip 방지)와 간단한 용량 제한 처리
+                # Secure extraction (prevent zip-slip) and simple limits
                 MAX_FILES = 5000
                 MAX_TOTAL_UNCOMPRESSED = 1_000_000_000  # bytes
                 total_uncompressed = 0
@@ -226,7 +150,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             raise RuntimeError('Zip total size too large')
                     zf.extractall(path=tmp_dir)
 
-                # color/ 와 depth/ 디렉터리가 있어야 합니다(대소문자 유연 처리 포함).
+                # Expect color/ and depth/ directories
                 color_dir = tmp_dir / 'color'
                 depth_dir = tmp_dir / 'depth'
                 if not color_dir.exists() or not depth_dir.exists():
@@ -242,7 +166,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 depth_count = len(depth_files)
                 depth_map_info = {'depth_count': depth_count}
 
-                # 트리 전체에서 intrinsics를 탐색하여 카메라 파라미터/스케일 정보를 사용합니다.
+                # Try to discover intrinsics recursively in the extracted tree so we can
+                # use any recorded meta (e.g., depth_scale or color width/height)
                 intr = None
                 intr_source = None
                 try:
@@ -279,7 +204,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 except Exception:
                     intr = None
 
-                # 깊이 파일 샘플 검증(최대 10개): dtype/shape/유효 픽셀 등 점검
+                # Early validation: sample up to 10 depth files evenly to check dtype/shape and valid pixels
                 depth_validation = []
                 try:
                     if depth_count == 0:
@@ -327,9 +252,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     except Exception:
                         pass
 
-                    # 깊이 스케일 추론(휴리스틱)
-                    # - intrinsics.meta.depth_scale 우선
-                    # - 샘플 통계가 크면 mm→m(0.001)로 가정
+                    # Infer a depth scale factor (raw units -> meters). Heuristic:
+                    # - if intrinsics file contained meta.depth_scale, prefer that
+                    # - else if samples show integer dtype or median_valid > 1000, assume mm -> m
                     depth_scale_factor = 1.0
                     inferred_unit = 'meters'
                     try:
@@ -381,9 +306,10 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     except Exception:
                         pass
 
-                # color 디렉터리에 대해 OpenPose 실행
-                # openpose.openpose는 --write_images 경로로 dirname을 사용하므로,
-                # output_img_dir 하위 파일 경로를 인자로 넘겨 해당 폴더에 이미지가 저장되도록 합니다.
+                # Run OpenPose on color images directory
+                # Note: openpose.openpose expects an "output_img_path" whose dirname() is used
+                # for the --write_images flag. To ensure images go into output_img_dir, pass
+                # a file path under that directory (the dirname will then be output_img_dir).
                 run_openpose_on_dir(str(color_dir), str(output_json_dir), str(output_img_dir / 'out'))
 
                 # Pair JSON outputs with depth .npy by frame index ordering and build DataFrame
@@ -513,7 +439,6 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                             cy = float(intr.get('cy'))
                                             fx = float(intr.get('fx'))
                                             fy = float(intr.get('fy'))
-                                            # (original behavior) do not modify Zm here; use raw sampled depth units
                                             X = (x - cx) * Zm / fx
                                             Y = (y - cy) * Zm / fy
                                         except Exception:
@@ -553,150 +478,49 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
                 df_3d = pd.DataFrame(rows)
 
-                # Build a 2D tidy DataFrame (frame, person_idx, joint_idx, x, y, conf)
-                # using the parsed OpenPose JSON (result_by_frame) so overlay uses pure 2D pixel coords.
-                try:
-                    rows2 = []
-                    for frame_idx, ppl in enumerate(result_by_frame):
-                        for person_idx, person in enumerate(ppl):
-                            for joint_idx, (x, y, c) in enumerate(person):
-                                rows2.append({'frame': frame_idx, 'person_idx': person_idx, 'joint_idx': joint_idx, 'x': float(x), 'y': float(y), 'conf': float(c)})
-                    df_2d = pd.DataFrame(rows2)
-                except Exception:
-                    df_2d = pd.DataFrame()
-
-                # Also produce 'wide' DataFrames expected by metric modules: wide2 (2D pixels) and wide3 (3D X/Y/Z)
-                try:
-                    from metric_algorithm.runner_utils import tidy_to_wide
-                    wide2 = tidy_to_wide(df_2d, dimension='2d', person_idx=0) if (not df_2d.empty) else pd.DataFrame()
-                except Exception:
-                    wide2 = pd.DataFrame()
-
-                try:
-                    # df_3d already contains rows with X,Y,Z columns - convert to wide using tidy_to_wide
-                    # The tidy rows used for df_3d are in variable 'rows' above
-                    df3_tidy = pd.DataFrame(rows)
-                    wide3 = tidy_to_wide(df3_tidy, dimension='3d', person_idx=0) if (not df3_tidy.empty) else pd.DataFrame()
-                except Exception:
-                    wide3 = pd.DataFrame()
-
-                # Persist original RGB frames into dest_dir/img BEFORE tmpdir is removed so operators
-                # and metric modules can access them. For 2D input we extract frames from the input MP4;
-                # for 3D input we copy the recorder's color/ images. Keep OpenPose rendered images (if any)
-                # available under dest_dir/openpose_img for debugging.
+                # Persist OpenPose rendered images into dest_dir BEFORE tmpdir is removed so operators
+                # and metric modules can access them. This avoids images disappearing when TemporaryDirectory
+                # context manager removes the tmpdir at the end of the with block.
                 try:
                     dest_img_dir = Path(dest_dir) / 'img'
                     dest_img_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Prefer original color frames (if present). For 3D runs color_dir contains originals.
-                    try:
-                        # If color_dir exists in tmp tree, copy those images as the canonical RGB frames
-                        if 'color_dir' in locals() and Path(color_dir).exists():
-                            for p in sorted(Path(color_dir).iterdir()):
-                                try:
-                                    if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg'):
-                                        shutil.copy2(str(p), str(dest_img_dir / p.name))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-
-                    # If we have an input mp4 (2D path), try to extract frames into dest/img so overlays draw on RGB
-                    try:
-                        if 'local_video' in locals() and Path(local_video).exists():
-                            try:
-                                import cv2 as _cv2
-                                cap = _cv2.VideoCapture(str(local_video))
-                                idx = 0
-                                while True:
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        break
-                                    outp = dest_img_dir / f"{idx:06d}.png"
-                                    try:
-                                        _cv2.imwrite(str(outp), frame)
-                                    except Exception:
-                                        # fallback: skip frame write
-                                        pass
-                                    idx += 1
-                                cap.release()
-                            except Exception:
-                                # if OpenCV missing or fails, fall back to copying OpenPose images below
-                                pass
-                    except Exception:
-                        pass
-
-                    # If no original frames were copied/extracted, fall back to copying OpenPose images
-                    # but DO NOT copy OpenPose-rendered images (they are stored separately in openpose_img).
-                    try:
-                        has_rgb = any(p for p in dest_img_dir.iterdir())
-                    except Exception:
-                        has_rgb = False
-                    if not has_rgb and output_img_dir.exists():
+                    if output_img_dir.exists():
                         for p in sorted(output_img_dir.iterdir()):
                             try:
                                 if p.is_file():
-                                    lname = p.name.lower()
-                                    # skip rendered/debug images (these are persisted under openpose_img)
-                                    if 'render' in lname or 'openpose' in lname:
-                                        continue
                                     shutil.copy2(str(p), str(dest_img_dir / p.name))
                             except Exception:
                                 pass
-
-                    # Also persist OpenPose rendered images into dest_dir/openpose_img for debugging
-                    try:
-                        openpose_dest = Path(dest_dir) / 'openpose_img'
-                        openpose_dest.mkdir(parents=True, exist_ok=True)
-                        if output_img_dir.exists():
-                            for p in sorted(output_img_dir.iterdir()):
-                                try:
-                                    if p.is_file():
-                                        shutil.copy2(str(p), str(openpose_dest / p.name))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
                 except Exception:
                     pass
 
                 # If no overlay mp4 yet, create a simple mp4 from copied images (written into dest_dir)
                 try:
-                    # Prefer using original color frames if available (avoid using OpenPose-rendered images)
-                    imgs = []
-                    try:
-                        # prefer color_dir (original frames) when present
-                        if 'color_dir' in locals() and Path(color_dir).exists():
-                            imgs = sorted([p for p in Path(color_dir).iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
-                            src_desc = 'color_dir'
-                        else:
-                            imgs = sorted([p for p in dest_img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if dest_img_dir.exists() else []
-                            src_desc = 'dest_img_dir'
-                        # deduplicate by name while preserving order
-                        seen = set()
-                        uniq = []
-                        for p in imgs:
-                            if p.name in seen:
-                                continue
-                            seen.add(p.name)
-                            uniq.append(p)
-                        imgs = uniq
-                    except Exception:
-                        imgs = []
-                        src_desc = 'none'
-
+                    imgs = sorted([p for p in dest_img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if dest_img_dir.exists() else []
                     if imgs:
                         try:
-                            from metric_algorithm.runner_utils import images_to_mp4
-                            out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
-                            created, used = images_to_mp4(imgs, out_mp4, fps=30.0, resize=None, filter_rendered=True, write_debug=True)
-                            if created:
-                                try:
-                                    (Path(dest_dir) / 'overlay_debug.json').write_text(json.dumps({'overlay_source': src_desc, 'images_used': used}), encoding='utf-8')
-                                except Exception:
-                                    pass
+                            import cv2
+                            h, w = None, None
+                            for p in imgs:
+                                im = cv2.imread(str(p))
+                                if im is None:
+                                    continue
+                                h, w = im.shape[:2]
+                                break
+                            if h is not None and w is not None:
+                                out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
+                                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                                vw = cv2.VideoWriter(str(out_mp4), fourcc, 30.0, (w, h))
+                                for p in imgs:
+                                    im = cv2.imread(str(p))
+                                    if im is None:
+                                        continue
+                                    if im.shape[1] != w or im.shape[0] != h:
+                                        im = cv2.resize(im, (w, h))
+                                    vw.write(im)
+                                vw.release()
                         except Exception:
-                            # ignore if helper missing or fails
+                            # ignore if OpenCV not available or fails
                             pass
                 except Exception:
                     pass
@@ -737,151 +561,26 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         with out_path.open('w', encoding='utf-8') as f:
             json.dump(response_payload, f, ensure_ascii=False, indent=2)
 
-        # Persist OpenPose rendered images into dest_dir/openpose_img for debugging and
-        # avoid copying them into dest_dir/img to prevent mixing rendered + original frames.
+        # Copy rendered images into the persistent dest_dir so metric modules can access them
         try:
-            openpose_dest = Path(dest_dir) / 'openpose_img'
-            openpose_dest.mkdir(parents=True, exist_ok=True)
+            # output_img_dir contains OpenPose rendered images inside tmpdir; copy a reasonable sample set
+            dest_img_dir = Path(dest_dir) / 'img'
+            dest_img_dir.mkdir(parents=True, exist_ok=True)
+            # copy images (preserve names)
             for p in sorted(output_img_dir.iterdir() if output_img_dir.exists() else []):
                 try:
                     if p.is_file():
-                        # Always copy rendered/openpose images into openpose_img for diagnostics
-                        shutil.copy2(str(p), str(openpose_dest / p.name))
+                        shutil.copy2(str(p), str(dest_img_dir / p.name))
                 except Exception:
                     pass
         except Exception:
             pass
 
         # Optionally run local metrics using the in-memory DataFrames; run_metrics_in_process will write CSVs into dest_dir
-        metrics_res = None
         try:
-            metrics_res = run_metrics_in_process(dimension, locals())
+            run_metrics_in_process(dimension, locals())
         except Exception:
             # metrics failures shouldn't take down processing
-            traceback.print_exc()
-
-        # If the metric runner produced structured output, merge it into the job result JSON
-        try:
-            if isinstance(metrics_res, dict):
-                # Get per-module payload
-                metrics_payload = metrics_res.get('metrics') if 'metrics' in metrics_res else metrics_res
-
-                cleaned_metrics = {}
-                for mname, mval in (metrics_payload.items() if isinstance(metrics_payload, dict) else []):
-                    # If module returned non-dict (e.g., error string), keep as-is
-                    if not isinstance(mval, dict):
-                        cleaned_metrics[mname] = mval
-                        continue
-
-                    cleaned = {}
-
-                    # Keep summary if available
-                    if 'summary' in mval and isinstance(mval['summary'], dict):
-                        cleaned['summary'] = mval['summary']
-
-                    # Collect CSV paths from values (strings or lists)
-                    csv_paths = []
-                    for k, v in mval.items():
-                        # skip overlay/mp4 etc.
-                        if k.lower().startswith('overlay'):
-                            continue
-                        if isinstance(v, str) and v.lower().endswith('.csv'):
-                            p = Path(v)
-                            if not p.exists():
-                                # try relative to dest_dir
-                                p = Path(dest_dir) / v
-                            if p.exists():
-                                csv_paths.append(p)
-                        elif isinstance(v, (list, tuple)):
-                            for it in v:
-                                if isinstance(it, str) and it.lower().endswith('.csv'):
-                                    p = Path(it)
-                                    if not p.exists():
-                                        p = Path(dest_dir) / it
-                                    if p.exists():
-                                        csv_paths.append(p)
-
-                    # If we found CSVs, read and merge them into frame_data
-                    if csv_paths:
-                        try:
-                            dfs = []
-                            for p in csv_paths:
-                                try:
-                                    df = pd.read_csv(p)
-                                except Exception:
-                                    # skip unreadable csv
-                                    continue
-                                # normalize frame column name
-                                if 'frame' not in df.columns and 'Frame' in df.columns:
-                                    df = df.rename(columns={'Frame': 'frame'})
-                                if 'frame' in df.columns:
-                                    df = df.set_index('frame')
-                                else:
-                                    # use row order as frame index
-                                    df.index.name = 'frame'
-                                dfs.append(df)
-                            if dfs:
-                                # merge on index (frame)
-                                from functools import reduce
-                                def _join(a, b):
-                                    return a.join(b, how='outer', lsuffix='_l', rsuffix='_r')
-                                merged = reduce(_join, dfs) if len(dfs) > 1 else dfs[0]
-
-                                frame_data = {}
-                                for idx, row in merged.iterrows():
-                                    # cast index to int if possible
-                                    try:
-                                        fkey = int(idx)
-                                    except Exception:
-                                        fkey = str(idx)
-                                    rowd = {}
-                                    for col, val in row.items():
-                                        if pd.isna(val):
-                                            rowd[col] = None
-                                        else:
-                                            # convert numpy scalar to python type
-                                            try:
-                                                if hasattr(val, 'item'):
-                                                    val = val.item()
-                                            except Exception:
-                                                pass
-                                            rowd[col] = val
-                                    frame_data[str(fkey)] = rowd
-                                cleaned['frame_data'] = frame_data
-                        except Exception:
-                            # non-fatal — include raw csv paths if conversion failed
-                            cleaned['frame_data_error'] = 'failed to read/convert csv'
-
-                    # Keep overlay info (s3 or local) if present
-                    if 'overlay_mp4' in mval:
-                        cleaned['overlay_mp4'] = mval.get('overlay_mp4')
-                    if 'overlay_s3' in mval:
-                        cleaned['overlay_s3'] = mval.get('overlay_s3')
-
-                    # If no summary and no frame_data, preserve original (may include error info)
-                    if not cleaned:
-                        cleaned_metrics[mname] = mval
-                    else:
-                        cleaned_metrics[mname] = cleaned
-
-                response_payload['metrics'] = cleaned_metrics
-
-                # include path to the saved metrics JSON when available
-                if 'metrics_path' in metrics_res:
-                    response_payload['metrics_path'] = metrics_res.get('metrics_path')
-                else:
-                    metrics_path_candidate = Path(dest_dir) / f"{job_id}_metric_result.json"
-                    if metrics_path_candidate.exists():
-                        response_payload['metrics_path'] = str(metrics_path_candidate)
-
-                # overwrite the job json on disk with enriched payload so upload picks it up
-                try:
-                    out_path = Path(dest_dir) / f"{job_id}.json"
-                    with out_path.open('w', encoding='utf-8') as f:
-                        json.dump(response_payload, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    traceback.print_exc()
-        except Exception:
             traceback.print_exc()
 
         # If metrics did not create an overlay mp4, create a minimal overlay from copied images
@@ -890,113 +589,42 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             mp4s = list(Path(dest_dir).glob(f"{job_id}*.mp4"))
             if not mp4s:
                 img_dir_check = Path(dest_dir) / 'img'
-                # prefer color_dir when available (color_dir may not be in this scope, try to detect)
-                imgs = []
-                try:
-                    if 'color_dir' in locals() and Path(color_dir).exists():
-                        imgs = sorted([p for p in Path(color_dir).iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
-                        src_desc = 'color_dir'
-                    else:
-                        imgs = sorted([p for p in img_dir_check.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if img_dir_check.exists() else []
-                        src_desc = 'dest_img_dir'
-                    # dedupe while preserving order
-                    seen = set()
-                    uniq = []
-                    for p in imgs:
-                        if p.name in seen:
-                            continue
-                        seen.add(p.name)
-                        uniq.append(p)
-                    imgs = uniq
-                except Exception:
-                    imgs = []
-                    src_desc = 'none'
-
+                imgs = sorted([p for p in img_dir_check.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if img_dir_check.exists() else []
                 if imgs:
+                    # create a simple mp4 using OpenCV
                     try:
-                        from metric_algorithm.runner_utils import images_to_mp4
-                        out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
-                        created, used = images_to_mp4(imgs, out_mp4, fps=30.0, resize=None, filter_rendered=True, write_debug=True)
-                        if created:
-                            try:
-                                (Path(dest_dir) / 'overlay_debug.json').write_text(json.dumps({'overlay_source': src_desc, 'images_used': used}), encoding='utf-8')
-                            except Exception:
-                                pass
+                        import cv2
+                        h, w = None, None
+                        for p in imgs:
+                            im = cv2.imread(str(p))
+                            if im is None:
+                                continue
+                            h, w = im.shape[:2]
+                            break
+                        if h is not None and w is not None:
+                            out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
+                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                            vw = cv2.VideoWriter(str(out_mp4), fourcc, 30.0, (w, h))
+                            for p in imgs:
+                                im = cv2.imread(str(p))
+                                if im is None:
+                                    continue
+                                if im.shape[1] != w or im.shape[0] != h:
+                                    im = cv2.resize(im, (w, h))
+                                vw.write(im)
+                            vw.release()
                     except Exception:
-                        # ignore if helper missing or fails
+                        # ignore if OpenCV not available
                         pass
         except Exception:
-            pass
-
-        # --- Reorganize received_payloads layout: move CSVs -> csv/, MP4s -> mp4/
-        try:
-            csv_dir = Path(dest_dir) / 'csv'
-            mp4_dir = Path(dest_dir) / 'mp4'
-            csv_dir.mkdir(parents=True, exist_ok=True)
-            mp4_dir.mkdir(parents=True, exist_ok=True)
-
-            # Move CSV files from dest root into csv/
-            for p in sorted(Path(dest_dir).glob('*.csv')):
-                try:
-                    target = csv_dir / p.name
-                    if target.exists():
-                        # avoid overwrite; keep existing
-                        p.unlink()
-                    else:
-                        p.replace(target)
-                except Exception:
-                    # non-fatal
-                    pass
-
-            # Move MP4 files from dest root into mp4/
-            for p in sorted(Path(dest_dir).glob('*.mp4')):
-                try:
-                    target = mp4_dir / p.name
-                    if target.exists():
-                        p.unlink()
-                    else:
-                        p.replace(target)
-                except Exception:
-                    pass
-
-            # Update response_payload.metrics overlay paths to be relative into mp4/ if files were moved
-            try:
-                if 'metrics' in response_payload and isinstance(response_payload['metrics'], dict):
-                    for mname, mval in response_payload['metrics'].items():
-                        if isinstance(mval, dict) and 'overlay_mp4' in mval and mval.get('overlay_mp4'):
-                            ov = mval.get('overlay_mp4')
-                            try:
-                                ovp = Path(ov)
-                                if not ovp.exists():
-                                    # maybe the file was moved to mp4/
-                                    cand = mp4_dir / ovp.name
-                                    if cand.exists():
-                                        # set relative path so downstream readers resolve against dest_dir
-                                        mval['overlay_mp4'] = str(Path('mp4') / cand.name)
-                                else:
-                                    # file still at root; move it into mp4/ (already attempted) and update path
-                                    mval['overlay_mp4'] = str(Path('mp4') / ovp.name)
-                            except Exception:
-                                # leave as-is if anything goes wrong
-                                pass
-            except Exception:
-                pass
-
-            # rewrite job json with updated relative paths
-            try:
-                out_path = Path(dest_dir) / f"{job_id}.json"
-                with out_path.open('w', encoding='utf-8') as f:
-                    json.dump(response_payload, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        except Exception:
-            # non-fatal; continue
             pass
 
         return response_payload
 
         # cleanup tmp if desired (do not remove in case debugging needed)
         # shutil.rmtree(tmp_dir)
+
+        return response_payload
     except Exception as e:
         # Save error info to dest_dir for debugging
         try:
@@ -1041,44 +669,13 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
             raise FileNotFoundError(f'Result file not found: {local_json}')
 
         uploaded = []
-
-        # Build a more specific target prefix: prefer user/dimension/<input_stem>/ if s3_key provided
-        target_prefix = None
-        if s3_key:
-            try:
-                k = s3_key.lstrip('/')
-                parts = k.split('/')
-                if len(parts) >= 3:
-                    # parts: [user, dimension, ..., filename]
-                    # use user/dimension/<input_stem> where input_stem is filename without extension
-                    input_fn = parts[-1]
-                    stem = Path(input_fn).stem
-                    target_prefix = f"{parts[0]}/{parts[1]}/{stem}"
-                elif len(parts) == 2:
-                    # user/dimension only
-                    target_prefix = f"{parts[0]}/{parts[1]}"
-                else:
-                    target_prefix = None
-            except Exception:
-                target_prefix = None
-
-        # Upload job json itself into the target prefix (so result.json sits at prefix root)
-        if target_prefix:
-            job_key = f"{target_prefix}/{local_json.name}"
+        # upload main json
+        if prefix:
+            json_key = f"{prefix}/{job_id}.json"
         else:
-            job_key = f"results/{local_json.name}"
-        s3.upload_file(str(local_json), bucket, job_key)
-        uploaded.append({'local': str(local_json), 'bucket': bucket, 'key': job_key})
-
-        # upload combined metrics JSON if produced by metric runner
-        metrics_json_local = Path(dest_dir) / f"{job_id}_metric_result.json"
-        if metrics_json_local.exists():
-            if target_prefix:
-                mkey = f"{target_prefix}/{metrics_json_local.name}"
-            else:
-                mkey = f"results/{metrics_json_local.name}"
-            s3.upload_file(str(metrics_json_local), bucket, mkey)
-            uploaded.append({'local': str(metrics_json_local), 'bucket': bucket, 'key': mkey})
+            json_key = f"results/{job_id}.json"
+        s3.upload_file(str(local_json), bucket, json_key)
+        uploaded.append({'local': str(local_json), 'bucket': bucket, 'key': json_key})
 
         # upload any overlay mp4 files found in dest_dir
         # overlay filenames convention: either '{job_id}*.mp4' or '*.mp4' in dest_dir
@@ -1089,15 +686,10 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
 
         for mp in mp4_candidates:
             fname = mp.name
-            # place mp4s under <prefix>/mp4/<fname> so overlay_mp4 paths like 'mp4/<fname>' resolve inside the prefix
-            if target_prefix:
-                key = f"{target_prefix}/mp4/{fname}"
-            elif prefix:
-                # older behavior: use user/dimension
+            if prefix:
                 key = f"{prefix}/{fname}"
             else:
                 key = f"results/{fname}"
-            # ensure the mp4/ prefix exists in key path (S3 is flat; this just sets key)
             s3.upload_file(str(mp), bucket, key)
             uploaded.append({'local': str(mp), 'bucket': bucket, 'key': key})
 
