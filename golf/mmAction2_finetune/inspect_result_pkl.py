@@ -48,5 +48,5 @@ if __name__ == '__main__':
     main()
 
 '''
-python d:\Jabez\golf\mmAction2_finetune\inspect_result_pkl.py results\finetune_test_result_389b30b3.pkl --n 10
+python d:\Jabez\golf\mmAction2_finetune\inspect_result_pkl.py results\finetune_test_result_e3c3d500.pkl --n 10
 '''

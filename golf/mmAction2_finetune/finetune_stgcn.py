@@ -16,30 +16,37 @@ import subprocess
 MM_ROOT = r"D:\mmaction2"
 sys.path.append(MM_ROOT)
 
+# Frequently-used defaults (hardcoded for this task)
+DEVICE = "cuda:0"
+BATCH_SIZE = 16
+LR = 0.01
+VAL_SPLIT = "xsub_val"
+
+# Fixed paths for this project/task (override here instead of CLI)
+# You can edit these constants directly when needed.
+DEFAULT_INPUT_PKL = r"D:\golfDataset\crop_pkl\combined_5class.pkl"
+DEFAULT_CFG = r"configs\skeleton\stgcnpp\my_stgcnpp.py"
+DEFAULT_PRETRAINED = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth"
+DEFAULT_WORK_DIR = r"D:\work_dirs\finetune_stgcn_fix"
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input-pkl', required=True,
-                        help='통합 annotation PKL 파일 경로')
-    parser.add_argument('--cfg',        required=True,
-                        help='MMAction2 config.py 경로 (MMAction2 루트 기준)')
-    parser.add_argument('--pretrained', required=True,
-                        help='사전학습된 ST-GCN 체크포인트(.pth)')
+    parser.add_argument('--epochs', type=int, default=30,
+                        help='max_epochs override')
     parser.add_argument('--test-pkl',   required=False, default='',
                         help='(optional) test annotation PKL 경로 (omit to skip test override)')
-    parser.add_argument('--work-dir',   default='work_dirs/finetune_stgcn',
-                        help='MMAction2 --work-dir')
-    parser.add_argument('--device',     default='cuda:0',
-                        help='CUDA 디바이스 (ex: cuda:0)')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='batch_size override')
-    parser.add_argument('--epochs',     type=int, default=30,
-                        help='max_epochs override')
-    parser.add_argument('--lr',         type=float, default=0.01,
-                        help='learning rate override')
-    parser.add_argument('--val-split',  default='xsub_val',
-                        help='validation split 이름')
     args = parser.parse_args()
+
+    # Use module-level defaults for frequently-changed values
+    args.input_pkl = DEFAULT_INPUT_PKL
+    args.cfg = DEFAULT_CFG
+    args.pretrained = DEFAULT_PRETRAINED
+    args.work_dir = DEFAULT_WORK_DIR
+    args.device = DEVICE
+    args.batch_size = BATCH_SIZE
+    args.lr = LR
+    args.val_split = VAL_SPLIT
 
     # config 파일 경로 확인
     cfg_path = os.path.join(MM_ROOT, args.cfg.strip())

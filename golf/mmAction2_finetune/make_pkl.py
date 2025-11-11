@@ -257,12 +257,19 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
         annotations.append(ann)
         samples.append(frame_dir)
 
+    # Diagnostic counts before normalization
+    parsed_ann_count = len(annotations)
+    print(f"Parsed annotations from CSVs: {parsed_ann_count}")
+
     # Normalize/validate collected annotations: ensure 'keypoint' is a numpy
     # ndarray of dtype float32 and shape (M, T, V, 2) where M is number of
     # persons (usually 1). This accepts the legacy (T, V, 2) format produced
     # by csv_to_annotation and wraps it into (1, T, V, 2). We also populate
     # helpful metadata fields expected by the MMAction2 pipeline.
     cleaned_annotations = []
+    skipped_short = 0
+    skipped_shape = 0
+    skipped_conversion = 0
     for ann in tqdm(annotations, desc="Normalizing annotations", unit="sample"):
         kp = ann.get('keypoint')
         if isinstance(kp, list):
@@ -270,6 +277,7 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
                 kp = np.stack([np.array(f) for f in kp], axis=0).astype(np.float32)
             except Exception:
                 print(f"[WARN] could not convert keypoint list for {ann.get('frame_dir')}, skipping sample")
+                skipped_conversion += 1
                 continue
         elif isinstance(kp, np.ndarray):
             kp = kp.astype(np.float32)
@@ -278,6 +286,7 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
                 kp = np.array(kp, dtype=np.float32)
             except Exception:
                 print(f"[WARN] unknown keypoint type for {ann.get('frame_dir')}, skipping sample")
+                skipped_conversion += 1
                 continue
 
         # Accept legacy shape (T, V, 2) and wrap to (1, T, V, 2)
@@ -288,6 +297,7 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
             pass
         else:
             print(f"[WARN] keypoint for {ann.get('frame_dir')} has invalid shape {getattr(kp, 'shape', None)}, skipping")
+            skipped_shape += 1
             continue
 
         # Ensure dtype
@@ -295,6 +305,11 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
 
         # Populate/ensure metadata fields downstream components expect
         total_frames = kp.shape[1]
+        # Exclude samples with 50 frames or fewer per user request
+        if int(total_frames) <= 50:
+            skipped_short += 1
+            # skip this sample
+            continue
         img_shape = ann.get('img_shape', (1080, 1920))
         # keypoint_score: default to ones if not provided (shape: M, T, V)
         if 'keypoint_score' in ann:
@@ -312,9 +327,14 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
         ann['img_shape'] = tuple(img_shape)
         ann.setdefault('metainfo', {'frame_dir': ann.get('frame_dir')})
 
+        # append this normalized/validated annotation
         cleaned_annotations.append(ann)
 
     annotations = cleaned_annotations
+
+    # Diagnostic summary after normalization
+    final_count = len(annotations)
+    print(f"Normalization summary: parsed={parsed_ann_count}, final={final_count}, skipped_short={skipped_short}, skipped_shape={skipped_shape}, skipped_conversion={skipped_conversion}")
 
     # optional train/val split
     random.seed(seed)
@@ -338,7 +358,7 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
     with open(out_pkl, 'wb') as f:
         pickle.dump(combined, f)
 
-    print(f"[OK] Wrote combined PKL: {out_pkl} -> {len(annotations)} samples")
+    print(f"[OK] Wrote combined PKL: {out_pkl} -> {len(annotations)} samples (skipped {skipped_short} samples with <=50 frames)")
 
 
 def cli():

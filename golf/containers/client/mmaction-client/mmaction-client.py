@@ -81,22 +81,70 @@ def test_api_connection(file_path):
 
     print(f"\n✅ API 요청 성공 (처리 시간: {end_time - start_time:.2f}초)")
     print(f"   num_samples: {result.get('num_samples')}")
-    preds = result.get('predictions', [])
-    # server now returns a simple list of booleans in result['predictions']
-    # Print first 3 and the full predictions as JSON so frontend can consume
-    # the booleans directly (true/false without quotes).
-    import json
 
-    try:
-        first3_json = json.dumps(preds[:3])
-        full_json = json.dumps(preds)
-    except Exception:
-        # fallback to string representation if JSON serialization fails
-        first3_json = str(preds[:3])
-        full_json = str(preds)
+    # New server format supports detailed single-sample debug output.
+    # Prefer 'prediction' (scalar) + 'predictions_list' (full list). Fallback
+    # to legacy 'predictions' list if present.
+    single_pred = result.get('prediction', None)
+    pred_index = result.get('pred_index', None)
+    preds_list = result.get('predictions_list', None)
+    legacy_preds = result.get('predictions', None)
 
-    print(f"   predictions (first 3): {first3_json}")
-    print(f"   predictions_json: {full_json}")
+    # raw debug fields
+    raw_scores = result.get('raw_scores', None)
+    probs = result.get('probs', None)
+    confidence = result.get('confidence', None)
+    topk = result.get('topk', None)
+
+    # Determine what to display
+    if result.get('num_samples') == 1:
+        # For single-sample pipelines, show the scalar prediction if available
+        if single_pred is not None or pred_index is not None:
+            print(f"   prediction: {single_pred} (index={pred_index})")
+            # pretty-print topk/probs if available
+            if confidence is not None:
+                print(f"   confidence: {confidence:.4f}")
+            if topk:
+                try:
+                    print(f"   topk: {json.dumps(topk)}")
+                except Exception:
+                    print(f"   topk: {topk}")
+            if probs is not None:
+                try:
+                    print(f"   probs: {json.dumps(probs)}")
+                except Exception:
+                    print(f"   probs: {probs}")
+        else:
+            # Fallback: try legacy predictions list
+            if legacy_preds is not None:
+                # legacy might be a list; show first element if present
+                val = legacy_preds[0] if isinstance(legacy_preds, (list, tuple)) and len(legacy_preds) > 0 else legacy_preds
+                print(f"   prediction (legacy): {val}")
+            elif preds_list is not None:
+                val = preds_list[0] if len(preds_list) > 0 else None
+                print(f"   prediction (from predictions_list): {val}")
+            else:
+                print("   prediction: not available in response")
+    else:
+        # Multi-sample: show first 3 entries from whichever list is available
+        out_list = None
+        if preds_list is not None:
+            out_list = preds_list
+        elif legacy_preds is not None:
+            out_list = legacy_preds
+
+        if out_list is not None:
+            try:
+                first3_json = json.dumps(out_list[:3])
+                full_json = json.dumps(out_list)
+            except Exception:
+                first3_json = str(out_list[:3])
+                full_json = str(out_list)
+            print(f"   predictions (first 3): {first3_json}")
+            print(f"   predictions_json: {full_json}")
+        else:
+            print("   predictions: not present in response")
+
     if 'accuracy' in result:
         print(f"   accuracy: {result.get('accuracy'):.4f}")
     else:
