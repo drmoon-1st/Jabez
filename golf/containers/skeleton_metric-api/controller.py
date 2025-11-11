@@ -29,9 +29,42 @@ import shutil
 
 import numpy as np
 import pandas as pd
+# Import mmaction_client robustly: when this module is executed as a top-level script
+# (e.g. inside a container via `python controller.py` or uvicorn importing module by name),
+# relative imports like `from . import mmaction_client` can fail with
+# "attempted relative import with no known parent package". Try relative first,
+# then fall back to absolute import which works when the package root is on sys.path.
+try:
+    from . import mmaction_client
+except Exception:
+    import mmaction_client
 
 from openpose.skeleton_interpolate import interpolate_sequence
 from openpose.openpose import run_openpose_on_video, run_openpose_on_dir, _sanitize_person_list
+
+
+def _safe_write_json(path: Path, obj: dict):
+    """Atomically write JSON to `path` by writing to a temp file and replacing.
+
+    Uses json.dump with default=str so Path objects won't break serialization.
+    """
+    try:
+        tmp = Path(str(path) + '.tmp')
+        with tmp.open('w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+        # atomic replace
+        try:
+            tmp.replace(path)
+        except Exception:
+            # fallback to os.replace
+            os.replace(str(tmp), str(path))
+    except Exception:
+        # best-effort: try non-atomic write
+        try:
+            with path.open('w', encoding='utf-8') as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            pass
 
 
 def run_metrics_in_process(dimension: str, ctx: dict):
@@ -734,8 +767,56 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             pass
 
         out_path = dest_dir / f"{job_id}.json"
-        with out_path.open('w', encoding='utf-8') as f:
-            json.dump(response_payload, f, ensure_ascii=False, indent=2)
+        # If an async MMACTION thread was started, wait briefly for its response file
+        try:
+            mmaction_resp_path = None
+            dbg = response_payload.get('debug', {})
+            # candidates for response path: earlier helpers set mmaction_start.response_path or use standard name
+            if isinstance(dbg.get('mmaction_start'), dict) and dbg['mmaction_start'].get('response_path'):
+                mmaction_resp_path = Path(dbg['mmaction_start'].get('response_path'))
+            # fallback to canonical path in dest_dir
+            if mmaction_resp_path is None:
+                mmaction_resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+
+            # only wait if thread started flag is present
+            thread_started = dbg.get('mmaction_thread_started') or dbg.get('mmaction_thread_started_later') or response_payload.setdefault('debug', {}).get('mmaction_thread_started')
+            if thread_started:
+                # allow override via env var
+                try:
+                    wait_secs = int(os.environ.get('MMACTION_WAIT_SECONDS', '30'))
+                except Exception:
+                    wait_secs = 30
+                # poll for file existence with small sleep intervals
+                import time
+                elapsed = 0
+                interval = 0.5
+                while elapsed < wait_secs:
+                    if mmaction_resp_path.exists():
+                        break
+                    time.sleep(interval)
+                    elapsed += interval
+                # if response file appeared, merge into response_payload
+                try:
+                    if mmaction_resp_path.exists():
+                        try:
+                            resp_txt = mmaction_resp_path.read_text(encoding='utf-8')
+                            resp_obj = json.loads(resp_txt)
+                        except Exception:
+                            resp_obj = None
+                        if resp_obj:
+                            # if the POST wrapper returned a 'resp_json' with 'result', merge it
+                            rj = resp_obj.get('resp_json') if isinstance(resp_obj, dict) else None
+                            if isinstance(rj, dict) and 'result' in rj:
+                                response_payload['stgcn_inference'] = rj['result']
+                            else:
+                                # if worker wrote full result at top-level, keep it
+                                response_payload['stgcn_inference'] = resp_obj
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        _safe_write_json(out_path, response_payload)
 
         # Persist OpenPose rendered images into dest_dir/openpose_img for debugging and
         # avoid copying them into dest_dir/img to prevent mixing rendered + original frames.
@@ -877,10 +958,128 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 # overwrite the job json on disk with enriched payload so upload picks it up
                 try:
                     out_path = Path(dest_dir) / f"{job_id}.json"
-                    with out_path.open('w', encoding='utf-8') as f:
-                        json.dump(response_payload, f, ensure_ascii=False, indent=2)
+                    _safe_write_json(out_path, response_payload)
                 except Exception:
                     traceback.print_exc()
+        except Exception:
+            traceback.print_exc()
+        # --- Prepare and persist canonical skeleton2d.csv in dest_dir for MMACTION client ---
+        try:
+            # prefer df_2d wide conversion produced earlier by tidy_to_wide or recreate from df_2d
+            try:
+                from metric_algorithm.runner_utils import tidy_to_wide
+                wide2 = tidy_to_wide(df_2d, dimension='2d', person_idx=0) if (isinstance(df_2d, pd.DataFrame) and not df_2d.empty) else (wide2 if 'wide2' in locals() else pd.DataFrame())
+            except Exception:
+                wide2 = wide2 if 'wide2' in locals() else pd.DataFrame()
+
+            # Normalize column names/order to canonical skeleton2d.csv ordering
+            if isinstance(wide2, pd.DataFrame) and not wide2.empty:
+                # ensure columns are in the exact order as sample skeleton2d.csv
+                COCO_ORDER = [
+                    'Nose','LEye','REye','LEar','REar','LShoulder','RShoulder','LElbow','RElbow','LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle'
+                ]
+                cols = []
+                for j in COCO_ORDER:
+                    cols.extend([f"{j}_x", f"{j}_y", f"{j}_c"])
+                # Build a canonical skeleton2d.csv with exact COCO columns (Nose..RAnkle + _x/_y/_c)
+                try:
+                    COCO_ORDER = [
+                        'Nose','LEye','REye','LEar','REar','LShoulder','RShoulder','LElbow','RElbow','LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle'
+                    ]
+                    cols_canonical = []
+                    for j in COCO_ORDER:
+                        cols_canonical.extend([f"{j}_x", f"{j}_y", f"{j}_c"])
+
+                    # Prepare lower-case lookup for available aliases in wide2
+                    records = wide2.to_dict(orient='records') if not wide2.empty else []
+                    ske_rows = []
+                    for rec in records:
+                        # build a lowercased key->value map to match aliases case-insensitively
+                        lc_map = {str(k).lower(): v for k, v in rec.items()}
+
+                        newr = {}
+                        for j in COCO_ORDER:
+                            # check common aliases for x
+                            x_keys = [f"{j}__x", f"{j}_x", f"{j}_X", f"{j}__X"]
+                            y_keys = [f"{j}__y", f"{j}_y", f"{j}_Y", f"{j}__Y"]
+                            c_keys = [f"{j}__c", f"{j}_c", f"{j}_conf", f"{j}_score"]
+                            # lowercase-map versions
+                            x_val = None
+                            y_val = None
+                            c_val = None
+                            for k in x_keys:
+                                if k.lower() in lc_map:
+                                    x_val = lc_map[k.lower()]
+                                    break
+                            for k in y_keys:
+                                if k.lower() in lc_map:
+                                    y_val = lc_map[k.lower()]
+                                    break
+                            for k in c_keys:
+                                if k.lower() in lc_map:
+                                    c_val = lc_map[k.lower()]
+                                    break
+                            # coerce to floats or NaN-like None
+                            try:
+                                newr[f"{j}_x"] = float(x_val) if x_val is not None else ''
+                            except Exception:
+                                newr[f"{j}_x"] = ''
+                            try:
+                                newr[f"{j}_y"] = float(y_val) if y_val is not None else ''
+                            except Exception:
+                                newr[f"{j}_y"] = ''
+                            try:
+                                newr[f"{j}_c"] = float(c_val) if c_val is not None else ''
+                            except Exception:
+                                newr[f"{j}_c"] = ''
+                        ske_rows.append(newr)
+
+                    ske_df = pd.DataFrame(ske_rows, columns=cols_canonical)
+                    ske_path = Path(dest_dir) / 'skeleton2d.csv'
+                    ske_df.to_csv(ske_path, index=False)
+                    response_payload.setdefault('debug', {})['mmaction_input_csv'] = str(ske_path)
+                    try:
+                        mmaction_start = mmaction_client.start_mmaction_from_csv(ske_path, dest_dir, job_id, dimension, response_payload)
+                        response_payload.setdefault('debug', {})['mmaction_start'] = mmaction_start
+                        # If the client returned a thread handle, attempt to join it (with timeout)
+                        try:
+                            th = None
+                            if isinstance(mmaction_start, dict):
+                                th = mmaction_start.get('thread')
+                            # also consider debug flags that indicate a later-started thread
+                            if th and hasattr(th, 'join'):
+                                try:
+                                    # allow a short timeout to avoid blocking long-running inference
+                                    join_timeout = float(os.environ.get('MMACTION_JOIN_SECONDS', '5'))
+                                except Exception:
+                                    join_timeout = 5.0
+                                try:
+                                    th.join(timeout=join_timeout)
+                                except Exception:
+                                    pass
+                                # after join (or timeout), read response file and merge
+                                try:
+                                    resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+                                    if resp_path.exists():
+                                        try:
+                                            resp_txt = resp_path.read_text(encoding='utf-8')
+                                            resp_obj = json.loads(resp_txt)
+                                        except Exception:
+                                            resp_obj = None
+                                        if resp_obj:
+                                            rj = resp_obj.get('resp_json') if isinstance(resp_obj, dict) else None
+                                            if isinstance(rj, dict) and 'result' in rj:
+                                                response_payload['stgcn_inference'] = rj['result']
+                                            else:
+                                                response_payload['stgcn_inference'] = resp_obj
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        response_payload.setdefault('debug', {})['mmaction_start_error'] = True
+                except Exception:
+                    response_payload.setdefault('debug', {})['mmaction_skeleton_write_error'] = True
         except Exception:
             traceback.print_exc()
 
@@ -985,12 +1184,158 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # rewrite job json with updated relative paths
             try:
                 out_path = Path(dest_dir) / f"{job_id}.json"
-                with out_path.open('w', encoding='utf-8') as f:
-                    json.dump(response_payload, f, ensure_ascii=False, indent=2)
+                _safe_write_json(out_path, response_payload)
             except Exception:
+                pass
+            # Verify/repair skeleton2d.csv in csv/ directory: ensure COCO _x/_y/_c columns exist
+            try:
+                ske_dir = csv_dir
+                ske_csv = ske_dir / 'skeleton2d.csv'
+                if ske_csv.exists():
+                    try:
+                        missing = mmaction_client._validate_csv_matches_coco(ske_csv)
+                        if missing:
+                            # attempt to rebuild from df_2d if available
+                            if 'df_2d' in locals() and isinstance(df_2d, pd.DataFrame) and not df_2d.empty:
+                                from metric_algorithm.runner_utils import tidy_to_wide
+                                try:
+                                    wide2_recon = tidy_to_wide(df_2d, dimension='2d', person_idx=0)
+                                except Exception:
+                                    wide2_recon = pd.DataFrame()
+                                if isinstance(wide2_recon, pd.DataFrame) and not wide2_recon.empty:
+                                    # recreate canonical skeleton csv rows
+                                    COCO_ORDER = [
+                                        'Nose','LEye','REye','LEar','REar','LShoulder','RShoulder','LElbow','RElbow','LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle'
+                                    ]
+                                    cols_canonical = [f"{j}_x" for j in COCO_ORDER] + [f"{j}_y" for j in COCO_ORDER] + [f"{j}_c" for j in COCO_ORDER]
+                                    # build ske_rows similar to earlier logic
+                                    ske_rows = []
+                                    for rec in wide2_recon.to_dict(orient='records'):
+                                        lc_map = {str(k).lower(): v for k, v in rec.items()}
+                                        newr = {}
+                                        for j in COCO_ORDER:
+                                            x_keys = [f"{j}__x", f"{j}_x", f"{j}_X", f"{j}__X"]
+                                            y_keys = [f"{j}__y", f"{j}_y", f"{j}_Y", f"{j}__Y"]
+                                            c_keys = [f"{j}__c", f"{j}_c", f"{j}_conf", f"{j}_score"]
+                                            x_val = next((lc_map[k.lower()] for k in x_keys if k.lower() in lc_map), None)
+                                            y_val = next((lc_map[k.lower()] for k in y_keys if k.lower() in lc_map), None)
+                                            c_val = next((lc_map[k.lower()] for k in c_keys if k.lower() in lc_map), None)
+                                            try:
+                                                newr[f"{j}_x"] = float(x_val) if x_val is not None else ''
+                                            except Exception:
+                                                newr[f"{j}_x"] = ''
+                                            try:
+                                                newr[f"{j}_y"] = float(y_val) if y_val is not None else ''
+                                            except Exception:
+                                                newr[f"{j}_y"] = ''
+                                            try:
+                                                newr[f"{j}_c"] = float(c_val) if c_val is not None else ''
+                                            except Exception:
+                                                newr[f"{j}_c"] = ''
+                                        ske_rows.append(newr)
+                                    ske_df = pd.DataFrame(ske_rows, columns=[f"{j}_{s}" for j in COCO_ORDER for s in ('x','y','c')])
+                                    ske_df.to_csv(ske_csv, index=False)
+                                    response_payload.setdefault('debug', {})['mmaction_input_csv_rebuilt'] = str(ske_csv)
+                                else:
+                                    response_payload.setdefault('debug', {})['mmaction_input_rebuild_failed'] = True
+                            else:
+                                response_payload.setdefault('debug', {})['mmaction_input_missing_df2'] = True
+                    except Exception:
+                        response_payload.setdefault('debug', {})['mmaction_input_validation_error'] = True
+                else:
+                    # No skeleton file in csv/ — try to write one from df_2d if present
+                    if 'df_2d' in locals() and isinstance(df_2d, pd.DataFrame) and not df_2d.empty:
+                        try:
+                            from metric_algorithm.runner_utils import tidy_to_wide
+                            wide2_recon = tidy_to_wide(df_2d, dimension='2d', person_idx=0)
+                        except Exception:
+                            wide2_recon = pd.DataFrame()
+                        if isinstance(wide2_recon, pd.DataFrame) and not wide2_recon.empty:
+                            COCO_ORDER = [
+                                'Nose','LEye','REye','LEar','REar','LShoulder','RShoulder','LElbow','RElbow','LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle'
+                            ]
+                            ske_rows = []
+                            for rec in wide2_recon.to_dict(orient='records'):
+                                lc_map = {str(k).lower(): v for k, v in rec.items()}
+                                newr = {}
+                                for j in COCO_ORDER:
+                                    x_keys = [f"{j}__x", f"{j}_x", f"{j}_X", f"{j}__X"]
+                                    y_keys = [f"{j}__y", f"{j}_y", f"{j}_Y", f"{j}__Y"]
+                                    c_keys = [f"{j}__c", f"{j}_c", f"{j}_conf", f"{j}_score"]
+                                    x_val = next((lc_map[k.lower()] for k in x_keys if k.lower() in lc_map), None)
+                                    y_val = next((lc_map[k.lower()] for k in y_keys if k.lower() in lc_map), None)
+                                    c_val = next((lc_map[k.lower()] for k in c_keys if k.lower() in lc_map), None)
+                                    try:
+                                        newr[f"{j}_x"] = float(x_val) if x_val is not None else ''
+                                    except Exception:
+                                        newr[f"{j}_x"] = ''
+                                    try:
+                                        newr[f"{j}_y"] = float(y_val) if y_val is not None else ''
+                                    except Exception:
+                                        newr[f"{j}_y"] = ''
+                                    try:
+                                        newr[f"{j}_c"] = float(c_val) if c_val is not None else ''
+                                    except Exception:
+                                        newr[f"{j}_c"] = ''
+                                ske_rows.append(newr)
+                            ske_df = pd.DataFrame(ske_rows, columns=[f"{j}_{s}" for j in COCO_ORDER for s in ('x','y','c')])
+                            ske_csv_parent = ske_csv.parent if 'ske_csv' in locals() else ske_dir
+                            ensure_dir = lambda p: p.mkdir(parents=True, exist_ok=True)
+                            ensure_dir(ske_csv_parent)
+                            ske_df.to_csv(ske_csv_parent / 'skeleton2d.csv', index=False)
+                            response_payload.setdefault('debug', {})['mmaction_input_csv_written'] = str(ske_csv_parent / 'skeleton2d.csv')
+            except Exception:
+                # non-fatal
                 pass
         except Exception:
             # non-fatal; continue
+            pass
+
+        # --- FINAL WAIT: ensure we merge MMACTION/STGCN response into the final job JSON ---
+        try:
+            try:
+                final_wait = int(os.environ.get('MMACTION_FINAL_WAIT_SECONDS', '60'))
+            except Exception:
+                final_wait = 60
+            resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+            import time
+            elapsed = 0.0
+            interval = 0.5
+            # only wait if a thread was started or a start response_path was recorded
+            dbg = response_payload.get('debug', {})
+            thread_flag = dbg.get('mmaction_thread_started') or dbg.get('mmaction_thread_started_later') or dbg.get('mmaction_start', {}).get('thread_started') if isinstance(dbg.get('mmaction_start'), dict) else dbg.get('mmaction_thread_started')
+            # If thread was started (or mmaction_input exists), wait up to final_wait for resp file
+            if thread_flag or (Path(dest_dir) / f"{job_id}_mmaction_input.csv").exists():
+                while elapsed < final_wait:
+                    if resp_path.exists():
+                        break
+                    time.sleep(interval)
+                    elapsed += interval
+
+            # If response appeared, merge it into payload
+            try:
+                if resp_path.exists():
+                    try:
+                        resp_txt = resp_path.read_text(encoding='utf-8')
+                        resp_obj = json.loads(resp_txt)
+                    except Exception:
+                        resp_obj = None
+                    if resp_obj:
+                        rj = resp_obj.get('resp_json') if isinstance(resp_obj, dict) else None
+                        if isinstance(rj, dict) and 'result' in rj:
+                            response_payload['stgcn_inference'] = rj['result']
+                        else:
+                            response_payload['stgcn_inference'] = resp_obj
+                        # write final job json with inference merged
+                        try:
+                            out_path = Path(dest_dir) / f"{job_id}.json"
+                            _safe_write_json(out_path, response_payload)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        except Exception:
             pass
 
         return response_payload

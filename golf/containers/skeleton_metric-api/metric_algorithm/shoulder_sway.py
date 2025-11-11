@@ -304,6 +304,9 @@ def run_from_context(ctx: dict):
             wide2 = ctx.get('wide3')
 
         ensure_dir(dest)
+        # main() writes shoulder_sway_analysis.mp4 into the parent of overlay_mp4 in config;
+        # to match that behavior, write to dest/<job>_shoulder_sway_overlay.mp4 and also
+        # consider candidate name 'shoulder_sway_analysis.mp4' when returning results.
         overlay_path = dest / f"{job_id}_shoulder_sway_overlay.mp4"
 
         # If wide2 not provided in ctx, try to load overlay CSV path if available
@@ -335,7 +338,22 @@ def run_from_context(ctx: dict):
             try:
                 img_dir = Path(ctx.get('img_dir', dest))
                 lm = ctx.get('landmarks', {}) or {}
+                # Create both job-specific overlay and canonical analysis name for compatibility
                 overlay_sway(img_dir, wide2, overlay_path, fps, 'mp4v', lm)
+                # Also try to copy/duplicate to canonical CLI filename in dest
+                try:
+                    canonical = dest / 'shoulder_sway_analysis.mp4'
+                    try:
+                        import shutil as _sh
+                        _sh.copy2(str(overlay_path), str(canonical))
+                    except Exception:
+                        # if copy fails, try rename
+                        try:
+                            overlay_path.replace(canonical)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 return {'overlay_mp4': str(overlay_path)}
             except Exception:
                 # fall through to trying to find existing rendered files

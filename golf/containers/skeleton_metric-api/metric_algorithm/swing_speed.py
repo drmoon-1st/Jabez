@@ -1,4 +1,4 @@
-\# src/swing_speed.py
+# src/swing_speed.py
 # -*- coding: utf-8 -*-
 """
 Swing Speed 전용 분석기
@@ -1008,6 +1008,95 @@ def run_from_context(ctx: dict):
                 out['overlay_mp4'] = str(overlay_path)
         except Exception as e:
             out['errors']['overlay'] = str(e)
+
+        # Build full JSON matching main() and write to dest so CLI and run_from_context
+        # produce identical output files.
+        try:
+            job_id_local = job_id if 'job_id' in locals() and job_id is not None else ctx.get('job_id', None)
+            out_json = Path(dest) / "swing_speed_metric_result.json"
+            # construct frames_obj similar to main()
+            frames_obj = {}
+            dimension = out.get('dimension') or out.get('summary', {}).get('dimension') or ('3d' if out.get('summary') and out.get('summary').get('wrist_peak_km_h') is not None else '2d')
+            # prefer 'anal' if present (from computations above)
+            if 'anal' in locals():
+                if dimension == '3d':
+                    N = len(anal.get('v_m_s', []))
+                    for i in range(N):
+                        vm = float(anal['v_m_s'][i]) if np.isfinite(anal['v_m_s'][i]) else None
+                        vk = float(anal['v_km_h'][i]) if np.isfinite(anal['v_km_h'][i]) else None
+                        vp = float(anal['v_mph'][i]) if np.isfinite(anal['v_mph'][i]) else None
+                        frames_obj[str(i)] = {
+                            'wrist_speed_m_s': vm,
+                            'wrist_speed_km_h': vk,
+                            'wrist_speed_mph': vp,
+                        }
+                    summary = out.get('summary', {})
+                    out_obj = {
+                        'job_id': job_id_local,
+                        'dimension': '3d',
+                        'metrics': {
+                            'swing_speed': {
+                                'summary': summary,
+                                'metrics_data': {
+                                    'swing_speed_timeseries': frames_obj
+                                }
+                            }
+                        }
+                    }
+                else:
+                    # 2D: anal variable may be anal2d; handle calibrated vs px-only
+                    anal2d = locals().get('anal2d') or locals().get('anal')
+                    if anal2d is not None:
+                        N = len(anal2d.get('v_px_s', []))
+                        # if calibrated include m/s etc
+                        if anal2d.get('calibrated_m_per_px'):
+                            for i in range(N):
+                                vpx = float(anal2d['v_px_s'][i]) if np.isfinite(anal2d['v_px_s'][i]) else None
+                                vm = float(anal2d['v_m_s'][i]) if np.isfinite(anal2d['v_m_s'][i]) else None
+                                vk = float(anal2d['v_km_h'][i]) if np.isfinite(anal2d['v_km_h'][i]) else None
+                                vp = float(anal2d['v_mph'][i]) if np.isfinite(anal2d['v_mph'][i]) else None
+                                frames_obj[str(i)] = {
+                                    'wrist_speed_px_s': vpx,
+                                    'wrist_speed_m_s': vm,
+                                    'wrist_speed_km_h': vk,
+                                    'wrist_speed_mph': vp,
+                                }
+                        else:
+                            for i in range(N):
+                                vpx = float(anal2d['v_px_s'][i]) if np.isfinite(anal2d['v_px_s'][i]) else None
+                                frames_obj[str(i)] = {
+                                    'wrist_speed_px_s': vpx,
+                                    'wrist_speed_m_s': None,
+                                    'wrist_speed_km_h': None,
+                                    'wrist_speed_mph': None,
+                                }
+                        summary = out.get('summary', {})
+                        out_obj = {
+                            'job_id': job_id_local,
+                            'dimension': '2d',
+                            'metrics': {
+                                'swing_speed': {
+                                    'summary': summary,
+                                    'metrics_data': {
+                                        'swing_speed_timeseries': frames_obj
+                                    }
+                                }
+                            }
+                        }
+                    else:
+                        out_obj = {'job_id': job_id_local, 'dimension': '2d', 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
+            else:
+                out_obj = {'job_id': job_id_local, 'dimension': '2d', 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
+
+            try:
+                out_json.write_text(__import__('json').dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+            # return same dict
+            return out_obj
+        except Exception:
+            # if building JSON fails, still return the original out dict
+            return out
 
         return out
     except Exception as e:

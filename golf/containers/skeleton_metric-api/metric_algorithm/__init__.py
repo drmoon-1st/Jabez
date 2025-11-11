@@ -10,7 +10,7 @@ Usage examples:
 	m = get_metric_module('com_speed')
 	# then call m.compute_com_points_3d(...) as appropriate
 """
-from . import com_speed, head_speed, shoulder_sway, swing_speed, xfactor, csv_to_json, utils_io
+from . import com_speed, head_speed, shoulder_sway, swing_speed, xfactor, utils_io
 import os
 import boto3
 from pathlib import Path
@@ -153,6 +153,20 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		'dimension': dimension,
 	}
 
+	# Forward a small set of commonly-used optional context keys from the
+	# original ctx so modules that expect fps/codec/draw/etc still work when
+	# controller supplied them. Use None when not present so modules can fall
+	# back to their defaults.
+	for _k in ('fps', 'codec', 'draw', 'landmarks', 'm_per_px_2d', 'calibration_2d', 'subject'):
+		# Only add the key if the original ctx explicitly provided a non-None value.
+		# This preserves module-level default fallbacks like ctx.get('fps', 30).
+		try:
+			if _k in ctx and ctx.get(_k) is not None:
+				module_ctx[_k] = ctx.get(_k)
+		except Exception:
+			# ignore failures; leave key absent so modules use their defaults
+			pass
+
 	# Run each metric module's standardized runner if present
 	for name, mod in METRIC_MODULES.items():
 		try:
@@ -166,11 +180,24 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 					# If this is a 2D run, ensure modules have a metrics_csv to allow frame_data expansion.
 					if isinstance(res, dict) and str(dimension).lower() == '2d':
 						try:
-							# if module didn't provide any csv-like keys or provided them as null/None,
-							# attach the generated metrics_csv path so the expansion step can read per-frame values.
-							has_csv_key = any(('csv' in k.lower() and res.get(k)) for k in res.keys())
-							if not has_csv_key and metrics_csv.exists():
+							# if module didn't provide any csv-like keys as valid paths, attach the generated
+							# metrics_csv path so the expansion step can read per-frame values. Use a safe
+							# detection helper to avoid evaluating DataFrames (which cause ambiguous truth).
+							def _has_valid_csv_value(v):
+								if v is None:
+									return False
+								if isinstance(v, str):
+									return len(v.strip()) > 0
+								if isinstance(v, (list, tuple)):
+									return any(isinstance(x, str) and len(x.strip()) > 0 for x in v)
+								# other types (DataFrame, dict, etc) are not treated as valid CSV path values
+								return False
+							has_csv_key = any('csv' in k.lower() and _has_valid_csv_value(res.get(k)) for k in res.keys())
+							# Only inject the fallback metrics_csv when the module did not error and did not
+							# explicitly skip. Mark injected fallback so expansion step can ignore it.
+							if not has_csv_key and not res.get('error') and not res.get('skipped') and metrics_csv.exists():
 								res['metrics_csv'] = str(metrics_csv)
+								res['_metrics_csv_injected'] = True
 						except Exception:
 							pass
 					# expect res to be JSON-serializable (dict/list/primitive)
@@ -272,16 +299,26 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 				if not isinstance(m, dict):
 					continue
 
-				# Collect candidate CSV paths reported by module
+				# Collect candidate CSV paths reported by module. Only consider values that
+				# are explicit string paths (or lists of strings). Skip the runner-injected
+				# fallback when present (marker '_metrics_csv_injected').
 				csv_paths = []
-				# common keys that modules might set
 				for key in ('metrics_csv', 'metrics_csv_path', 'metrics_csvs', 'metrics'):
-					if key in m and m.get(key):
-						val = m.get(key)
-						if isinstance(val, (list, tuple)):
-							csv_paths.extend(val)
-						else:
-							csv_paths.append(val)
+					if key not in m:
+						continue
+					# skip fallback-injected CSVs: expansion should only process CSVs the module
+					# genuinely returned, not runner fallbacks.
+					if key == 'metrics_csv' and m.get('_metrics_csv_injected'):
+						continue
+					val = m.get(key)
+					if val is None:
+						continue
+					if isinstance(val, (list, tuple)):
+						for it in val:
+							if isinstance(it, str) and it.strip():
+								csv_paths.append(it)
+					elif isinstance(val, str) and val.strip():
+						csv_paths.append(val)
 
 				# Normalize paths and attempt to read them into dataframes
 				dfs = []

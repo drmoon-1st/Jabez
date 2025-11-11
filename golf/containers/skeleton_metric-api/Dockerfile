@@ -32,6 +32,8 @@ COPY api_server.py /opt/skeleton_metric-api/api_server.py
 COPY ./openpose /opt/skeleton_metric-api/openpose
 COPY controller.py /opt/skeleton_metric-api/controller.py
 COPY ./metric_algorithm /opt/skeleton_metric-api/metric_algorithm
+COPY .env /opt/skeleton_metric-api/.env
+COPY mmaction_client.py /opt/skeleton_metric-api/mmaction_client.py
 
 
 # Copy pose_iter_440000.caffemodel to the correct model directory

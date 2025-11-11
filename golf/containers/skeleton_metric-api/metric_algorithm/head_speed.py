@@ -847,6 +847,7 @@ def run_from_context(ctx: dict):
       - overlay_mp4: path or None
       - summary: small dict with numeric summaries
     """
+    # Clean, single implementation for programmatic use
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
@@ -854,21 +855,19 @@ def run_from_context(ctx: dict):
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
         # If wide2 is missing (no 2D CSV), but wide3 exists (3D run), use wide3 as a fallback
-        # Overlay drawing utilities are flexible in column names and can often use X/Y from wide3.
         if wide2 is None and wide3 is not None:
-            try:
-                wide2 = wide3
-            except Exception:
-                wide2 = None
+            wide2 = wide3
         img_dir = Path(ctx.get('img_dir', dest))
         codec = str(ctx.get('codec', 'mp4v'))
         ensure_dir(dest)
 
         out = {}
 
-        # Metrics (자동: 3D 또는 2D)
+        # Determine metrics DF (prefer 3D)
         use_df = wide3 if wide3 is not None else wide2
-        if use_df is not None:
+        if use_df is None:
+            out['metrics_csv'] = None
+        else:
             try:
                 use_3d = is_dataframe_3d(use_df)
             except Exception:
@@ -886,7 +885,6 @@ def run_from_context(ctx: dict):
                 return {'error': f'head_speed metrics failure: {e}'}
 
             try:
-                # Build a conservative metrics DataFrame similar to main()
                 N = len(use_df)
                 prefer_2d = not use_3d
                 nose_x = _get_axis_series(use_df, 'Nose', 'x', prefer_2d=prefer_2d)
@@ -911,10 +909,10 @@ def run_from_context(ctx: dict):
                     'rwrist_x': rw_x,
                     'rwrist_y': rw_y,
                     'rwrist_z': rw_z,
-                    'head_dx_addr': pre['head_dx'] if pre is not None else np.full(N, np.nan),
-                    'head_dy_addr': pre['head_dy'] if pre is not None else np.full(N, np.nan),
-                    'head_disp_addr': pre['head_disp'] if pre is not None else np.full(N, np.nan),
-                    'head_disp_pct': pre['head_disp_pct'] if pre is not None else np.full(N, np.nan),
+                    'head_dx_addr': pre.get('head_dx', np.full(N, np.nan)) if pre is not None else np.full(N, np.nan),
+                    'head_dy_addr': pre.get('head_dy', np.full(N, np.nan)) if pre is not None else np.full(N, np.nan),
+                    'head_disp_addr': pre.get('head_disp', np.full(N, np.nan)) if pre is not None else np.full(N, np.nan),
+                    'head_disp_pct': pre.get('head_disp_pct', np.full(N, np.nan)) if pre is not None else np.full(N, np.nan),
                 })
 
                 metrics_csv = dest / f"{job_id}_head_speed_metrics.csv"
@@ -922,9 +920,9 @@ def run_from_context(ctx: dict):
                 metrics_df.to_csv(metrics_csv, index=False)
                 out['metrics_csv'] = str(metrics_csv)
                 out['summary'] = {
-                    'impact_frame': int(pre['impact_frame']) if pre is not None and 'impact_frame' in pre else None,
-                    'disp_max_pct': float(pre['disp_max_pct']) if pre is not None and not np.isnan(pre.get('disp_max_pct', np.nan)) else None,
-                    'disp_rms_pct': float(pre['disp_rms_pct']) if pre is not None and not np.isnan(pre.get('disp_rms_pct', np.nan)) else None,
+                    'impact_frame': int(pre.get('impact_frame')) if pre is not None and 'impact_frame' in pre else None,
+                    'disp_max_pct': float(pre.get('disp_max_pct')) if pre is not None and not np.isnan(pre.get('disp_max_pct', np.nan)) else None,
+                    'disp_rms_pct': float(pre.get('disp_rms_pct')) if pre is not None and not np.isnan(pre.get('disp_rms_pct', np.nan)) else None,
                     'grade': pre.get('grade') if pre is not None else None,
                     'mean_head_speed': float(np.nanmean(head_speed_arr)) if len(head_speed_arr) > 0 else None,
                     'max_head_speed': float(np.nanmax(head_speed_arr)) if len(head_speed_arr) > 0 else None,
@@ -932,14 +930,10 @@ def run_from_context(ctx: dict):
                 }
             except Exception as e:
                 out['metrics_error'] = str(e)
-        else:
-            out['metrics_csv'] = None
 
-        # Overlay (2D)
-        overlay_path = dest / f"{job_id}_head_speed_overlay.mp4"
+        # Overlay (2D) rendering
         try:
             if wide2 is not None:
-                # optional smoothing from ctx.draw.smoothing
                 draw_cfg = ctx.get('draw', {}) or {}
                 smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
                 if smooth_cfg.get('enabled', False):
@@ -967,174 +961,61 @@ def run_from_context(ctx: dict):
                 else:
                     df_overlay_sm = wide2
 
-                # compute head pts if available (2D/3D 자동)
                 try:
                     if wide3 is not None and is_dataframe_3d(wide3):
-                        head_pts, _, _, _, _ = compute_head_speed_3d(wide3, landmark='Nose', fps=fps)
+                        head_pts, _, head_deviations, stability_metrics, head_unit = compute_head_speed_3d(wide3, landmark='Nose', fps=fps)
                     else:
-                        pts2, _, _, _, _ = compute_head_speed_2d(df_overlay_sm, landmark='Nose', fps=fps)
+                        pts2, _, head_deviations, stability_metrics, head_unit = compute_head_speed_2d(df_overlay_sm, landmark='Nose', fps=fps)
                         head_pts = np.hstack([pts2, np.zeros((len(pts2), 1))]) if len(pts2) > 0 else np.zeros((len(df_overlay_sm), 3))
                 except Exception:
                     head_pts = np.zeros((len(df_overlay_sm), 3))
 
-                overlay_head_video(img_dir, df_overlay_sm, head_pts, out.get('summary', {}).get('mean_head_speed', np.zeros(len(df_overlay_sm))),
-                                   out.get('summary', {}).get('mean_head_speed', np.zeros(len(df_overlay_sm))),
-                                   out.get('summary', {}) or {}, out.get('summary', {}).get('unit', 'mm/frame'), 'Nose', overlay_path, fps, codec)
-                out['overlay_mp4'] = str(overlay_path)
-        except Exception as e:
-            out.setdefault('overlay_error', str(e))
+                overlay_path = dest / f"{job_id}_head_speed_overlay.mp4"
+                try:
+                    overlay_head_video(img_dir, df_overlay_sm, head_pts, head_speed_arr if 'head_speed_arr' in locals() else np.zeros(len(df_overlay_sm)),
+                                       head_deviations if 'head_deviations' in locals() else np.zeros(len(df_overlay_sm)),
+                                       stability_metrics if 'stability_metrics' in locals() else {}, head_unit if 'head_unit' in locals() else 'mm/frame', 'Nose', overlay_path, fps, codec)
+                    out['overlay_mp4'] = str(overlay_path)
+                except Exception as e:
+                    out.setdefault('overlay_error', str(e))
+
+        except Exception:
+            # overlay is optional; don't fail entire run if rendering fails
+            pass
 
         return out
     except Exception as e:
-        return {'error': str(e)} 
+        return {'error': str(e)}
 
 
-# =========================================================
-# 메인 함수
-# =========================================================
 def main():
-    ap = argparse.ArgumentParser(description="Head Speed 전용 분석기")
-    ap.add_argument("-c", "--config", default=str(Path(__file__).parent.parent / "config" / "analyze.yaml"))
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(prog="head_speed.py", description="Head speed analysis (CLI wrapper around run_from_context)")
+    parser.add_argument('--metrics_csv', type=str, help='path to metrics CSV (will be used as wide2/wide3)')
+    parser.add_argument('--overlay_csv', type=str, help='path to overlay CSV (will be used as wide2)')
+    parser.add_argument('--img_dir', type=str, help='directory with frame images')
+    parser.add_argument('--dest', type=str, default='.', help='destination directory')
+    parser.add_argument('--job_id', type=str, default='job', help='job id prefix for outputs')
+    parser.add_argument('--fps', type=int, default=30, help='fps for overlay video')
+    parser.add_argument('--codec', type=str, default='mp4v', help='fourcc codec for overlay video')
+    args = parser.parse_args()
 
-    # 구성 파일 로드 (없으면 GOLF_pipeline 쪽으로 자동 폴백)
-    cfg_path = Path(args.config)
-    if not cfg_path.exists():
-        fb = _find_fallback_analyze_yaml(cfg_path)
-        if fb is None:
-            raise FileNotFoundError(f"analyze.yaml을 찾을 수 없습니다. 시도한 경로: {cfg_path}")
-        print(f"🔎 analyze.yaml 경로 자동 보정: {fb}")
-        cfg_path = fb
-    cfg = load_cfg(cfg_path)
+    ctx = {'dest_dir': args.dest, 'job_id': args.job_id, 'fps': args.fps, 'codec': args.codec}
+    if args.metrics_csv:
+        try:
+            ctx['wide3'] = pd.read_csv(args.metrics_csv)
+        except Exception:
+            ctx['wide3'] = None
+    if args.overlay_csv:
+        try:
+            ctx['wide2'] = pd.read_csv(args.overlay_csv)
+        except Exception:
+            ctx['wide2'] = None
+    if args.img_dir:
+        ctx['img_dir'] = args.img_dir
 
-    # CSV 분리: overlay(2D) vs metrics(3D)
-    overlay_csv: Optional[Path] = None
-    metrics_csv: Optional[Path] = None
-    if "overlay_csv_path" in cfg:
-        overlay_csv = Path(cfg["overlay_csv_path"]); print(f"📊 Overlay(2D) CSV 사용(head): {overlay_csv}")
-    elif "csv_path" in cfg:
-        overlay_csv = Path(cfg["csv_path"]); print(f"📊 Overlay(2D) CSV (fallback)(head): {overlay_csv}")
-    if "metrics_csv_path" in cfg:
-        metrics_csv = Path(cfg["metrics_csv_path"]); print(f"📊 Metrics CSV 사용(head): {metrics_csv}")
-    elif "csv_path" in cfg:
-        metrics_csv = Path(cfg["csv_path"]); print(f"📊 Metrics CSV (fallback)(head): {metrics_csv}")
-    img_dir = Path(cfg["img_dir"])
-    fps = int(cfg.get("fps", 30))
-    codec = str(cfg.get("codec", "mp4v"))
-    
-    # 머리 관절 이름
-    lm_cfg = cfg.get("landmarks", {}) or {}
-    head_name = lm_cfg.get("head", "Nose")
-    
-    # 출력 경로 (Head 전용)
-    out_csv = Path(cfg["metrics_csv"]).parent / "head_speed_metrics.csv"
-    out_mp4 = Path(cfg["overlay_mp4"]).parent / "head_speed_analysis.mp4"
+    res = run_from_context(ctx)
+    print(res)
 
-    # 1) CSV 로드 (유연한 폴백 처리)
-    df_metrics = None
-    df_overlay = None
-    if metrics_csv is not None and metrics_csv.exists():
-        df_metrics = pd.read_csv(metrics_csv)
-    if overlay_csv is not None and overlay_csv.exists():
-        df_overlay = pd.read_csv(overlay_csv)
-    # 하나만 주어졌다면 서로 보완
-    if df_metrics is None and df_overlay is not None:
-        df_metrics = df_overlay
-        print("ℹ️ metrics CSV가 없어 overlay CSV를 메트릭용으로 재사용합니다.")
-    if df_overlay is None and df_metrics is not None:
-        df_overlay = df_metrics
-        print("ℹ️ overlay CSV가 없어 metrics CSV를 오버레이용으로 재사용합니다.")
-    if df_metrics is None and df_overlay is None:
-        raise RuntimeError("CSV를 찾을 수 없습니다. overlay_csv_path 또는 metrics_csv_path 또는 csv_path를 확인하세요.")
-    # 입력 크기 등 불필요 로그 제거
-
-    # 2) 임팩트 전 머리 움직임(%) 계산 (2D/3D 자동 분기)
-    use_3d = is_dataframe_3d(df_metrics)
-    if use_3d:
-        pre = compute_head_movement_preimpact(df_metrics, head_name, skip_ratio=0.2)
-    else:
-        pre = compute_head_movement_preimpact_2d(df_metrics, head_name, skip_ratio=0.2)
-
-    # 3) 결과 저장: 요청된 컬럼만 저장
-    N = len(df_metrics)
-    nose_x = _get_axis_series(df_metrics, head_name, 'x', prefer_2d=False)
-    nose_y = _get_axis_series(df_metrics, head_name, 'y', prefer_2d=False)
-    nose_z = _get_axis_series(df_metrics, head_name, 'z', prefer_2d=False)
-    lw_x = _get_axis_series(df_metrics, 'LWrist', 'x', prefer_2d=False)
-    lw_y = _get_axis_series(df_metrics, 'LWrist', 'y', prefer_2d=False)
-    lw_z = _get_axis_series(df_metrics, 'LWrist', 'z', prefer_2d=False)
-    rw_x = _get_axis_series(df_metrics, 'RWrist', 'x', prefer_2d=False)
-    rw_y = _get_axis_series(df_metrics, 'RWrist', 'y', prefer_2d=False)
-    rw_z = _get_axis_series(df_metrics, 'RWrist', 'z', prefer_2d=False)
-
-    metrics = pd.DataFrame({
-        'frame': range(N),
-        # 머리(Nose) 좌표
-        'nose_x': nose_x,
-        'nose_y': nose_y,
-        'nose_z': nose_z,
-        # 손목 좌표 (좌/우)
-        'lwrist_x': lw_x,
-        'lwrist_y': lw_y,
-        'lwrist_z': lw_z,
-        'rwrist_x': rw_x,
-        'rwrist_y': rw_y,
-        'rwrist_z': rw_z,
-        # 프레임별 변위 값들 (어드레스 대비)
-        'head_dx_addr': pre['head_dx'],
-        'head_dy_addr': pre['head_dy'],
-        'head_disp_addr': pre['head_disp'],
-        'head_disp_pct': pre['head_disp_pct'],
-    })
-    
-    ensure_dir(out_csv.parent)
-    metrics.to_csv(out_csv, index=False)
-    # 저장 로그 출력 생략 (요청에 따라 콘솔은 최소화)
-
-    # 4) 비디오 오버레이 (이전 동작 유지)
-    # 2D 스무딩 적용 가능
-    draw_cfg = cfg.get('draw', {}) or {}
-    smooth_cfg = (draw_cfg.get('smoothing') or {}) if isinstance(draw_cfg.get('smoothing'), dict) else {}
-    if smooth_cfg.get('enabled', False):
-        method = smooth_cfg.get('method', 'ema')
-        window = int(smooth_cfg.get('window', 5))
-        alpha = float(smooth_cfg.get('alpha', 0.2))
-        gaussian_sigma = smooth_cfg.get('gaussian_sigma')
-        hampel_sigma = smooth_cfg.get('hampel_sigma', 3.0)
-        oneeuro_min_cutoff = smooth_cfg.get('oneeuro_min_cutoff', 1.0)
-        oneeuro_beta = smooth_cfg.get('oneeuro_beta', 0.007)
-        oneeuro_d_cutoff = smooth_cfg.get('oneeuro_d_cutoff', 1.0)
-        df_overlay_sm = smooth_df_2d(
-            df_overlay,
-            prefer_2d=True,
-            method=method,
-            window=window,
-            alpha=alpha,
-            fps=fps,
-            gaussian_sigma=gaussian_sigma,
-            hampel_sigma=hampel_sigma,
-            oneeuro_min_cutoff=oneeuro_min_cutoff,
-            oneeuro_beta=oneeuro_beta,
-            oneeuro_d_cutoff=oneeuro_d_cutoff,
-        )
-    else:
-        df_overlay_sm = df_overlay
-
-    # 오버레이에 필요한 최소 메트릭 계산(2D/3D 자동)
-    if use_3d:
-        head_pts, head_speed, head_deviations, stability_metrics, head_unit = compute_head_speed_3d(df_metrics, head_name, fps)
-    else:
-        head_pts2, head_speed, head_deviations, stability_metrics, head_unit = compute_head_speed_2d(df_metrics, head_name, fps)
-        # head_pts는 2D라도 시그니처 맞추기 위해 (N,3)로 패딩
-        head_pts = np.hstack([head_pts2, np.zeros((len(head_pts2), 1))]) if len(head_pts2) > 0 else np.zeros((len(df_metrics), 3))
-    overlay_head_video(img_dir, df_overlay_sm, head_pts, head_speed, head_deviations,
-                       stability_metrics, head_unit, head_name, out_mp4, fps, codec)
-    
-    # 5) 콘솔 출력: 요청한 4줄만 출력
-    print(f"임팩트 프레임: {pre['impact_frame']} (선택 손목: {pre['selected_wrist']})")
-    print(f"   최대 변위: {pre['disp_max_pct']:.2f}% (스탠스 폭 대비)")
-    print(f"   RMS 변위: {pre['disp_rms_pct']:.2f}% (스탠스 폭 대비)")
-    print(f"   판정: {pre['grade']}")
 
 if __name__ == "__main__":
     main()

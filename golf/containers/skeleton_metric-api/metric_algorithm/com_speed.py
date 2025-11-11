@@ -1251,30 +1251,73 @@ def run_from_context(ctx: dict):
       - summary: simple numeric summaries {mean_com_speed, max_com_speed, unit}
       - overlay_error: error string if overlay failed (non-fatal)
     """
+    import traceback as _tb
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', 'job'))
-        # Prefer provided fps; fall back to 30
-        fps = int(ctx.get('fps', 30))
+        # Prefer provided fps; fall back to 30. Accept None (pass-through) if explicit None supplied.
+        _fps_val = ctx.get('fps', None)
+        if _fps_val is None:
+            fps = 30
+        else:
+            try:
+                fps = int(_fps_val)
+            except Exception:
+                # non-numeric fps -> fallback
+                try:
+                    fps = int(float(_fps_val))
+                except Exception:
+                    fps = 30
 
-        # Locate dataframes from context (accept multiple common keys)
-        wide3 = ctx.get('df_3d') or ctx.get('wide3') or ctx.get('metrics_df')
-        wide2 = ctx.get('df_2d') or ctx.get('wide2') or ctx.get('overlay_df')
+        # Locate dataframes from context (accept multiple common keys).
+        # Use explicit None checks to avoid evaluating DataFrame truth value.
+        wide3 = None
+        for k in ('df_3d', 'wide3', 'metrics_df'):
+            if k in ctx and ctx.get(k) is not None:
+                wide3 = ctx.get(k)
+                break
+        wide2 = None
+        for k in ('df_2d', 'wide2', 'overlay_df'):
+            if k in ctx and ctx.get(k) is not None:
+                wide2 = ctx.get(k)
+                break
+
+        # Coerce string paths (if any) to DataFrames when possible
+        try:
+            if isinstance(wide3, str):
+                p = Path(wide3)
+                if p.exists():
+                    wide3 = pd.read_csv(p)
+                else:
+                    wide3 = None
+        except Exception:
+            wide3 = None
+        try:
+            if isinstance(wide2, str):
+                p = Path(wide2)
+                if p.exists():
+                    wide2 = pd.read_csv(p)
+                else:
+                    wide2 = None
+        except Exception:
+            wide2 = None
 
         # If no 2D provided but 3D exists, allow using 3D for metrics and try 2D overlay from 3D if needed
         if wide2 is None and wide3 is not None:
-            try:
-                wide2 = wide3
-            except Exception:
-                wide2 = None
+            wide2 = wide3
 
         ensure_dir(dest)
 
         out = {}
 
-        # Metrics (자동: 3D 또는 2D)
+        # Build metrics and overlay similar to main(), and construct the same
+        # JSON structure that main() writes (com_metric_result.json). This ensures
+        # run_from_context produces the same outputs as running the module CLI.
         use_df = wide3 if wide3 is not None else wide2
-        if use_df is not None:
+        if use_df is None:
+            out['metrics_csv'] = None
+            # still attempt overlay if wide2 exists (but here both are None)
+        else:
             try:
                 try:
                     use_3d = is_dataframe_3d(use_df)
@@ -1282,53 +1325,171 @@ def run_from_context(ctx: dict):
                     use_3d = False
 
                 if use_3d:
-                    com_pts = compute_com_points_3d(use_df)
+                    com_pts = compute_com_points_3d(use_df, ignore_joints=None)
                     v, unit = speed_3d(com_pts, fps)
                     com_x = com_pts[:, 0]; com_y = com_pts[:, 1]; com_z = com_pts[:, 2]
                 else:
-                    com2 = compute_com_points_2d(use_df)
+                    com2 = compute_com_points_2d(use_df, ignore_joints=None)
                     v, unit = speed_2d(com2, fps)
                     com_x = com2[:, 0]; com_y = com2[:, 1]; com_z = np.full(len(com2), np.nan)
 
                 metrics_df = pd.DataFrame({
                     'frame': list(range(len(use_df))),
-                    'com_speed': list(map(float, v.tolist())),
-                    'com_x': [float(x) if np.isfinite(x) else None for x in com_x.tolist()],
-                    'com_y': [float(y) if np.isfinite(y) else None for y in com_y.tolist()],
-                    'com_z': [float(z) if np.isfinite(z) else None for z in com_z.tolist()],
+                    'com_speed': [float(x) if np.isfinite(x) else None for x in (v.tolist() if hasattr(v, 'tolist') else list(v))],
+                    'com_x': [float(x) if np.isfinite(x) else None for x in (com_x.tolist() if hasattr(com_x, 'tolist') else list(com_x))],
+                    'com_y': [float(y) if np.isfinite(y) else None for y in (com_y.tolist() if hasattr(com_y, 'tolist') else list(com_y))],
+                    'com_z': [float(z) if np.isfinite(z) else None for z in (com_z.tolist() if hasattr(com_z, 'tolist') else list(com_z))],
                 })
                 metrics_csv = dest / f"{job_id}_com_speed_metrics.csv"
                 ensure_dir(metrics_csv.parent)
-                metrics_df.to_csv(metrics_csv, index=False)
-                out['metrics_csv'] = str(metrics_csv)
-                out['summary'] = {
-                    'mean_com_speed': float(np.nanmean(v)) if len(v) > 0 else None,
-                    'max_com_speed': float(np.nanmax(v)) if len(v) > 0 else None,
-                    'unit': unit,
-                }
+                try:
+                    metrics_df.to_csv(metrics_csv, index=False)
+                    out['metrics_csv'] = str(metrics_csv)
+                except Exception as e:
+                    out['metrics_csv_error'] = str(e)
             except Exception as e:
-                return {'error': f'com_speed metrics failure: {e}'}
-        else:
-            out['metrics_csv'] = None
+                return {'error': f'com_speed metrics failure: {str(e)}', 'traceback': _tb.format_exc()}
 
-        # Overlay (2D). Try to use controller-copied images if available
+        # Overlay (2D)
         overlay_path = dest / f"{job_id}_com_speed_overlay.mp4"
         try:
             if wide2 is not None:
-                com2d = compute_com_points_2d(wide2)
-                # Determine image directory; default to dest/img copied by controller
+                com2d = compute_com_points_2d(wide2, ignore_joints=None)
                 img_dir = Path(ctx.get('img_dir', Path(dest) / 'img'))
-                # Recompute speed for overlay if not from earlier
-                if 'v' not in locals() or 'unit' not in locals() or not isinstance(unit, str):
-                    v_tmp, unit_tmp = speed_2d(com2d, fps)
-                else:
-                    v_tmp, unit_tmp = v, unit
-                overlay_com_video(img_dir, wide2, com2d, v_tmp, unit_tmp, overlay_path, fps, 'mp4v')
-                out['overlay_mp4'] = str(overlay_path)
+                # compute overlay speeds
+                try:
+                    v_tmp, unit_tmp = (v, unit)
+                except Exception:
+                    try:
+                        v_tmp, unit_tmp = speed_2d(com2d, fps)
+                    except Exception:
+                        v_tmp, unit_tmp = (np.zeros(len(com2d)), 'px/frame')
+                # only attempt overlay if image dir exists and has images
+                try:
+                    if Path(img_dir).exists():
+                        overlay_com_video(img_dir, wide2, com2d, v_tmp, unit_tmp, overlay_path, fps, 'mp4v', ignore_joints=None)
+                        out['overlay_mp4'] = str(overlay_path)
+                    else:
+                        out.setdefault('overlay_error', f'img_dir not found: {img_dir}')
+                except Exception as e:
+                    out.setdefault('overlay_error', str(e))
         except Exception as e:
-            # non-fatal; record error
             out.setdefault('overlay_error', str(e))
+
+        # Now compute COM shift / xfactor related summaries to match main()
+        try:
+            if use_df is not None:
+                if use_3d:
+                    stance_mid, stance_width = compute_stance_mid_and_width(use_df)
+                    impact_idx = detect_impact_by_crossing_3d(use_df, stance_mid)
+                    xf_by_plane = compute_xfactor_by_planes(use_df)
+                    chosen_plane, backswing_top = select_plane_and_backswing_top(xf_by_plane, impact_idx)
+                    com_rel = compute_com_x_rel(use_df, stance_mid)
+                else:
+                    stance_mid, stance_width = compute_stance_mid_and_width_2d(use_df)
+                    impact_idx = detect_impact_by_crossing_2d(use_df, stance_mid)
+                    chosen_plane = '2D'
+                    com_rel = compute_com_x_rel_2d(use_df, stance_mid)
+                    upto = max(min(impact_idx, len(com_rel) - 1), 0)
+                    pre = np.abs(com_rel[:upto+1]) if len(com_rel) > 0 else np.array([])
+                    if pre.size == 0 or np.all(np.isnan(pre)):
+                        backswing_top = 0
+                    else:
+                        with np.errstate(invalid='ignore'):
+                            backswing_top = int(np.nanargmax(pre))
+
+                transition_idx = find_transition_index(com_rel, backswing_top, impact_idx)
+
+                addr = float(np.nanmean(com_rel[:min(5, len(com_rel))])) if len(com_rel) > 0 else np.nan
+                back_at_top = float(com_rel[backswing_top]) if 0 <= backswing_top < len(com_rel) else np.nan
+                imp_at = float(com_rel[impact_idx]) if 0 <= impact_idx < len(com_rel) else np.nan
+
+                if stance_width and np.isfinite(stance_width) and stance_width != 0:
+                    back_shift_pct = 100.0 * (back_at_top - addr) / stance_width
+                    down_shift_pct = 100.0 * (imp_at - back_at_top) / stance_width
+                    impact_offset_pct = 100.0 * (imp_at - addr) / stance_width
+                    rms_pct = 100.0 * float(np.sqrt(np.nanmean((com_rel[:impact_idx] - addr)**2))) / stance_width if impact_idx > 0 else np.nan
+                else:
+                    back_shift_pct = down_shift_pct = impact_offset_pct = rms_pct = np.nan
+
+                back_grade = grade_back_shift(back_shift_pct)
+                down_grade = grade_down_shift(down_shift_pct)
+
+                result_obj = {
+                    'impact_frame': int(impact_idx),
+                    'backswing_top_frame': int(backswing_top),
+                    'transition_frame': (int(transition_idx) if transition_idx is not None else None),
+                    'chosen_plane': chosen_plane,
+                    'stance_width': float(stance_width) if stance_width is not None else None,
+                    'addr_com_x': addr,
+                    'back_at_top_com_x': back_at_top,
+                    'impact_com_x': imp_at,
+                    'back_shift_pct': back_shift_pct,
+                    'down_shift_pct': down_shift_pct,
+                    'impact_offset_pct': impact_offset_pct,
+                    'rms_pct': rms_pct,
+                    'back_shift_grade': back_grade,
+                    'down_shift_grade': down_grade,
+                }
+
+                # build per-frame timeseries dicts
+                speed_frames = {}
+                shift_frames = {}
+                for i in range(len(use_df)):
+                    speed_frames[str(i)] = {
+                        'com_speed': float(v[i]) if np.isfinite(v[i]) else None,
+                        'com_x': float(com_x[i]) if np.isfinite(com_x[i]) else None,
+                        'com_y': float(com_y[i]) if np.isfinite(com_y[i]) else None,
+                        'com_z': float(com_z[i]) if np.isfinite(com_z[i]) else None,
+                    }
+                    v_xf = (xf_by_plane[chosen_plane][i] if use_3d and chosen_plane in xf_by_plane and i < len(xf_by_plane[chosen_plane]) else (np.nan))
+                    v_mid = (stance_mid[i] if i < len(stance_mid) else np.nan)
+                    v_rel = (com_rel[i] if i < len(com_rel) else np.nan)
+                    shift_frames[str(i)] = {
+                        'xfactor_deg': float(v_xf) if np.isfinite(v_xf) else None,
+                        'stance_mid_x': float(v_mid) if np.isfinite(v_mid) else None,
+                        'com_rel_x': float(v_rel) if np.isfinite(v_rel) else None,
+                    }
+
+                # Build final JSON object identical in structure to main()
+                out_obj = {
+                    'job_id': job_id,
+                    'dimension': '3d' if use_3d else '2d',
+                    'metrics': {
+                        'com_speed': {
+                            'summary': {
+                                'mean_com_speed': float(np.nanmean(v)) if len(v) else None,
+                                'max_com_speed': float(np.nanmax(v)) if len(v) else None,
+                                'unit': {
+                                    'timeseries_main': unit
+                                }
+                            },
+                            'metrics_data': {
+                                'com_speed_timeseries': speed_frames
+                            }
+                        },
+                        'com_shift': {
+                            'summary': result_obj,
+                            'metrics_data': {
+                                'com_shift_timeseries': shift_frames
+                            }
+                        }
+                    }
+                }
+
+                # write module-level JSON to dest_dir to closely match main() output
+                try:
+                    out_json = Path(dest) / 'com_metric_result.json'
+                    out_json.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+                    out['module_json'] = str(out_json)
+                except Exception as e:
+                    out['module_json_error'] = str(e)
+                # return the same dict so caller can integrate
+                return out_obj
+        except Exception as e:
+            return {'error': str(e), 'traceback': _tb.format_exc()}
 
         return out
     except Exception as e:
-        return {'error': str(e)}
+        import traceback as _tb2
+        return {'error': str(e), 'traceback': _tb2.format_exc()}

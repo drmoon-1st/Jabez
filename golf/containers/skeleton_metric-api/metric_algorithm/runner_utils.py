@@ -19,6 +19,13 @@ import boto3
 import numpy as _np
 import pandas as _pd
 from typing import Any, Dict, Optional
+# Provide tidy_to_wide here for backward-compatible imports from controller
+try:
+    from .utils_io import tidy_to_wide
+except Exception:
+    # If import fails, define a placeholder that will raise when used
+    def tidy_to_wide(*args, **kwargs):
+        raise ImportError('tidy_to_wide is not available from metric_algorithm.utils_io')
 
 
 def normalize_value(v: Any):

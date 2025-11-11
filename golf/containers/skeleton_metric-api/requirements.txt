@@ -1,12 +1,17 @@
 # Requirements for skeleton_metric-api service
-# Pinned versions chosen for stability; adjust if you need newer releases.
-fastapi==0.95.2
-uvicorn==0.22.0
-numpy==1.24.4
-pandas==1.5.3
-pyyaml==6.0
-# Use headless OpenCV in container environments. If developing locally and you need GUI support,
-# install opencv-python instead of opencv-python-headless in your dev env.
-opencv-python-headless==4.7.0.72
+# Use unpinned package names by default to reduce version conflict risk.
+# Pin a specific version only when absolutely necessary.
+
+fastapi
+uvicorn
+numpy
+pandas
+pyyaml
+# Use headless OpenCV in container environments. For local GUI development you may
+# prefer `opencv-python` instead of `opencv-python-headless`.
+opencv-python-headless
 
 boto3
+
+# for stgcn-api request
+requests

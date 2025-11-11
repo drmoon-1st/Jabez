@@ -654,6 +654,43 @@ def run_from_context(ctx: dict):
         return out
     except Exception as e:
         return {'error': str(e)}
+    finally:
+        # Attempt to also write the rich JSON summary matching main() when possible
+        try:
+            if 'result' in locals() and 'xf_by_plane' in locals():
+                chosen = result.get('chosen_plane') or 'X-Z'
+                xfactor_series = xf_by_plane.get(chosen, [])
+                frames_obj = {str(i): {"xfactor_deg": (float(v) if np.isfinite(v) else None)} for i, v in enumerate(xfactor_series)}
+                job_id_local = job_id if 'job_id' in locals() else None
+                out_obj = {
+                    "job_id": job_id_local,
+                    "dimension": "3d",
+                    "metrics": {
+                        "xfactor": {
+                            "summary": {
+                                "chosen_plane": result.get("chosen_plane"),
+                                "xfactor_max_deg": result.get("xfactor_max_deg"),
+                                "xfactor_max_frame": result.get("xfactor_max_frame"),
+                                "xfactor_at_impact_deg": result.get("xfactor_at_impact_deg"),
+                                "impact_frame": result.get("impact_frame"),
+                                "xfactor_range": result.get("xfactor_range"),
+                                "xfactor_category": result.get("xfactor_category"),
+                                "xfactor_advice": result.get("xfactor_advice", []),
+                                "unit": "deg"
+                            },
+                            "metrics_data": {
+                                "xfactor_timeseries": frames_obj
+                            }
+                        }
+                    }
+                }
+                try:
+                    out_json = Path(dest) / "xfactor_metric_result.json"
+                    out_json.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+                except Exception:
+                    pass
+        except Exception:
+            pass
 # =========================================================
 # 메인
 # =========================================================
