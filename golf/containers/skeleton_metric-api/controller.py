@@ -754,6 +754,13 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             'frame_count': len(people_sequence)
         }
 
+        # include dimension and prepare a prefixed basename for all job-derived files
+        try:
+            response_payload['dimension'] = dimension
+        except Exception:
+            pass
+        result_basename = f"{dimension}_{job_id}"
+
         # Attach minimal DataFrame summary (not full CSV) for downstream verification.
         # DataFrames (df_2d or df_3d) are kept in memory for metrics; here we include simple metadata.
         try:
@@ -766,7 +773,10 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         except Exception:
             pass
 
-        out_path = dest_dir / f"{job_id}.json"
+        # write a debug/partial JSON early so operators can inspect intermediate state
+        partial_out_path = Path(dest_dir) / f"{result_basename}.partial.json"
+        out_path = Path(dest_dir) / f"{result_basename}.json"
+
         # If an async MMACTION thread was started, wait briefly for its response file
         try:
             mmaction_resp_path = None
@@ -774,9 +784,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # candidates for response path: earlier helpers set mmaction_start.response_path or use standard name
             if isinstance(dbg.get('mmaction_start'), dict) and dbg['mmaction_start'].get('response_path'):
                 mmaction_resp_path = Path(dbg['mmaction_start'].get('response_path'))
-            # fallback to canonical path in dest_dir
+            # fallback to canonical path in dest_dir (prefixed)
             if mmaction_resp_path is None:
-                mmaction_resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+                mmaction_resp_path = Path(dest_dir) / f"{result_basename}_stgcn_response.json"
 
             # only wait if thread started flag is present
             thread_started = dbg.get('mmaction_thread_started') or dbg.get('mmaction_thread_started_later') or response_payload.setdefault('debug', {}).get('mmaction_thread_started')
@@ -816,7 +826,14 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         except Exception:
             pass
 
-        _safe_write_json(out_path, response_payload)
+        try:
+            _safe_write_json(partial_out_path, response_payload)
+        except Exception:
+            # fallback to normal write
+            try:
+                _safe_write_json(out_path, response_payload)
+            except Exception:
+                pass
 
         # Persist OpenPose rendered images into dest_dir/openpose_img for debugging and
         # avoid copying them into dest_dir/img to prevent mixing rendered + original frames.
@@ -951,9 +968,18 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 if 'metrics_path' in metrics_res:
                     response_payload['metrics_path'] = metrics_res.get('metrics_path')
                 else:
-                    metrics_path_candidate = Path(dest_dir) / f"{job_id}_metric_result.json"
-                    if metrics_path_candidate.exists():
-                        response_payload['metrics_path'] = str(metrics_path_candidate)
+                    # prefer prefixed metric result name '<dimension>_<job_id>_metric_result.json'
+                    prefixed_candidate = None
+                    for p in Path(dest_dir).iterdir():
+                        if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
+                            prefixed_candidate = p
+                            break
+                    if prefixed_candidate and prefixed_candidate.exists():
+                        response_payload['metrics_path'] = str(prefixed_candidate)
+                    else:
+                        legacy_candidate = Path(dest_dir) / f"{job_id}_metric_result.json"
+                        if legacy_candidate.exists():
+                            response_payload['metrics_path'] = str(legacy_candidate)
 
                 # overwrite the job json on disk with enriched payload so upload picks it up
                 try:
@@ -1057,9 +1083,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                     th.join(timeout=join_timeout)
                                 except Exception:
                                     pass
-                                # after join (or timeout), read response file and merge
+                                # after join (or timeout), read response file and merge (prefixed name)
                                 try:
-                                    resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+                                    resp_path = Path(dest_dir) / f"{result_basename}_stgcn_response.json"
                                     if resp_path.exists():
                                         try:
                                             resp_txt = resp_path.read_text(encoding='utf-8')
@@ -1183,8 +1209,168 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
             # rewrite job json with updated relative paths
             try:
-                out_path = Path(dest_dir) / f"{job_id}.json"
+                out_path = Path(dest_dir) / f"{result_basename}.json"
+                if not out_path.exists():
+                    out_path = Path(dest_dir) / f"{job_id}.json"
                 _safe_write_json(out_path, response_payload)
+            except Exception:
+                pass
+            # --- Enrich missing per-metric data from metric CSVs in csv/ ---
+            try:
+                # look for metric CSVs (prefixed or legacy) and populate frame_data/summary
+                def _read_metrics_csv(candidate: Path):
+                    try:
+                        df = pd.read_csv(candidate)
+                        # normalize frame column
+                        if 'Frame' in df.columns and 'frame' not in df.columns:
+                            df = df.rename(columns={'Frame': 'frame'})
+                        if 'frame' in df.columns:
+                            df = df.set_index('frame')
+                        else:
+                            df.index.name = 'frame'
+                        frame_data = {}
+                        for idx, row in df.iterrows():
+                            try:
+                                fkey = int(idx)
+                            except Exception:
+                                fkey = str(idx)
+                            rowd = {}
+                            for col, val in row.items():
+                                if pd.isna(val):
+                                    rowd[col] = None
+                                else:
+                                    try:
+                                        if hasattr(val, 'item'):
+                                            val = val.item()
+                                    except Exception:
+                                        pass
+                                    rowd[col] = val
+                            frame_data[str(fkey)] = rowd
+                        return frame_data
+                    except Exception:
+                        return None
+
+                for metric_name in ('com_speed', 'swing_speed'):
+                    try:
+                        # prefer prefixed csv: '<dimension>_<job_id>_<metric>_metrics.csv'
+                        pref = None
+                        for p in csv_dir.iterdir():
+                            if p.is_file() and p.name.endswith(f"_{job_id}_{metric_name}_metrics.csv"):
+                                pref = p
+                                break
+                        if pref is None:
+                            # fallback legacy
+                            legacy = csv_dir / f"{job_id}_{metric_name}_metrics.csv"
+                            pref = legacy if legacy.exists() else None
+                        if pref and pref.exists():
+                            frame_data = _read_metrics_csv(pref)
+                            if frame_data:
+                                response_payload.setdefault('metrics', {}).setdefault(metric_name, {})['frame_data'] = frame_data
+                                # if the metric has a separate summary JSON, try to attach it
+                                summary_pref = Path(dest_dir) / f"{metric_name}_summary.json"
+                                # also try metric-specific patterns
+                                maybe_summary = Path(dest_dir) / f"{job_id}_{metric_name}_summary.json"
+                                if summary_pref.exists():
+                                    try:
+                                        response_payload['metrics'][metric_name]['summary'] = json.loads(summary_pref.read_text(encoding='utf-8'))
+                                    except Exception:
+                                        pass
+                                elif maybe_summary.exists():
+                                    try:
+                                        response_payload['metrics'][metric_name]['summary'] = json.loads(maybe_summary.read_text(encoding='utf-8'))
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # --- Also try to read combined metric_result.json and merge per-metric data ---
+            try:
+                metrics_result_path = None
+                for p in Path(dest_dir).iterdir():
+                    if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
+                        metrics_result_path = p
+                        break
+                if metrics_result_path is None:
+                    legacy_mr = Path(dest_dir) / f"{job_id}_metric_result.json"
+                    if legacy_mr.exists():
+                        metrics_result_path = legacy_mr
+                if metrics_result_path and metrics_result_path.exists():
+                    try:
+                        mr = json.loads(metrics_result_path.read_text(encoding='utf-8'))
+                        # mr may be structured with per-metric dicts
+                        if isinstance(mr, dict):
+                            for mname, mval in (mr.get('metrics') or mr).items():
+                                try:
+                                    if mname not in response_payload.setdefault('metrics', {}):
+                                        # no existing entry: copy entire metric dict
+                                        response_payload['metrics'][mname] = mval
+                                        continue
+
+                                    # merge into existing metric entry
+                                    tgt = response_payload['metrics'][mname]
+                                    if not isinstance(mval, dict):
+                                        # non-dict value: only set if missing
+                                        if mname not in response_payload['metrics']:
+                                            response_payload['metrics'][mname] = mval
+                                        continue
+
+                                    # 1) summary: prefer metric_result's summary (overwrite or set)
+                                    if 'summary' in mval and isinstance(mval.get('summary'), dict):
+                                        try:
+                                            tgt['summary'] = mval['summary']
+                                        except Exception:
+                                            pass
+
+                                    # 2) frame-wise data: accept either 'frame_data' or convert 'metrics_data' -> 'frame_data'
+                                    # If metric_result provides 'frame_data', merge it. If it provides 'metrics_data',
+                                    # attempt to extract a primary timeseries (e.g., 'com_speed_timeseries') and convert
+                                    try:
+                                        # merge existing frame_data if present
+                                        if 'frame_data' in mval and isinstance(mval['frame_data'], dict):
+                                            tgt_fd = tgt.setdefault('frame_data', {})
+                                            for fk, fv in mval['frame_data'].items():
+                                                if fk not in tgt_fd:
+                                                    tgt_fd[fk] = fv
+
+                                        elif 'metrics_data' in mval and isinstance(mval['metrics_data'], dict):
+                                            # pick the most likely timeseries subkey
+                                            md = mval['metrics_data']
+                                            timeseries_key = None
+                                            for k in md.keys():
+                                                if 'timeseries' in k.lower() or 'time_series' in k.lower():
+                                                    timeseries_key = k
+                                                    break
+                                            if timeseries_key is None:
+                                                # fallback to first key
+                                                keys = list(md.keys())
+                                                if keys:
+                                                    timeseries_key = keys[0]
+                                            if timeseries_key and isinstance(md.get(timeseries_key), dict):
+                                                src_ts = md.get(timeseries_key)
+                                                tgt_fd = tgt.setdefault('frame_data', {})
+                                                for fk, fv in src_ts.items():
+                                                    if fk not in tgt_fd:
+                                                        tgt_fd[str(fk)] = fv
+                                            # also preserve raw metrics_data for completeness
+                                            if 'metrics_data' not in tgt:
+                                                tgt['metrics_data'] = mval['metrics_data']
+                                    except Exception:
+                                        pass
+
+                                    # 3) overlay fields: copy or set overlay_mp4/overlay_s3
+                                    for ok in ('overlay_mp4', 'overlay_s3'):
+                                        try:
+                                            if ok in mval and mval.get(ok):
+                                                tgt[ok] = mval.get(ok)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            # ensure metrics_path points to the file we read
+                            response_payload['metrics_path'] = str(metrics_result_path)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Verify/repair skeleton2d.csv in csv/ directory: ensure COCO _x/_y/_c columns exist
@@ -1291,32 +1477,89 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # non-fatal; continue
             pass
 
-        # --- FINAL WAIT: ensure we merge MMACTION/STGCN response into the final job JSON ---
+        # --- FINAL WAIT: conservatively wait for metrics + MMACTION/STGCN responses before writing final JSON ---
         try:
             try:
-                final_wait = int(os.environ.get('MMACTION_FINAL_WAIT_SECONDS', '60'))
+                mmaction_final_wait = int(os.environ.get('MMACTION_FINAL_WAIT_SECONDS', '60'))
             except Exception:
-                final_wait = 60
-            resp_path = Path(dest_dir) / f"{job_id}_stgcn_response.json"
-            import time
-            elapsed = 0.0
-            interval = 0.5
-            # only wait if a thread was started or a start response_path was recorded
-            dbg = response_payload.get('debug', {})
-            thread_flag = dbg.get('mmaction_thread_started') or dbg.get('mmaction_thread_started_later') or dbg.get('mmaction_start', {}).get('thread_started') if isinstance(dbg.get('mmaction_start'), dict) else dbg.get('mmaction_thread_started')
-            # If thread was started (or mmaction_input exists), wait up to final_wait for resp file
-            if thread_flag or (Path(dest_dir) / f"{job_id}_mmaction_input.csv").exists():
-                while elapsed < final_wait:
-                    if resp_path.exists():
-                        break
-                    time.sleep(interval)
-                    elapsed += interval
-
-            # If response appeared, merge it into payload
+                mmaction_final_wait = 60
             try:
-                if resp_path.exists():
+                metrics_final_wait = int(os.environ.get('METRICS_FINAL_WAIT_SECONDS', '60'))
+            except Exception:
+                metrics_final_wait = 60
+
+            # candidate paths for STGCN response
+            resp_pref = Path(dest_dir) / f"{result_basename}_stgcn_response.json"
+            resp_legacy = Path(dest_dir) / f"{job_id}_stgcn_response.json"
+
+            # metrics readiness: prefer combined metric_result file, otherwise per-metric artifacts
+            metrics_ready = False
+            stgcn_ready = False
+
+            import time
+            start = time.time()
+            interval = 0.5
+
+            def check_metrics_ready():
+                # prefer combined metric_result json
+                for p in Path(dest_dir).iterdir():
+                    if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
+                        return True
+                if (Path(dest_dir) / f"{job_id}_metric_result.json").exists():
+                    return True
+                # fallback: check that per-metric CSVs exist for known metrics
+                csv_dir = Path(dest_dir) / 'csv'
+                if not csv_dir.exists():
+                    return False
+                needed = ['com_speed', 'swing_speed']
+                for m in needed:
+                    found = False
+                    for p in csv_dir.iterdir():
+                        if p.is_file() and (p.name.endswith(f"_{job_id}_{m}_metrics.csv") or p.name.endswith(f"{m}_metrics.csv") or p.name.endswith(f"{job_id}_{m}_metrics.csv")):
+                            found = True
+                            break
+                    if not found:
+                        return False
+                return True
+
+            def check_stgcn_ready():
+                if resp_pref.exists() or resp_legacy.exists():
+                    return True
+                return False
+
+            # Wait loop: require both metrics_ready and stgcn_ready or timeouts
+            while True:
+                now = time.time()
+                elapsed = now - start
+
+                # update flags
+                if not metrics_ready:
+                    metrics_ready = check_metrics_ready()
+                if not stgcn_ready:
+                    stgcn_ready = check_stgcn_ready()
+
+                # break conditions:
+                # - both ready
+                if metrics_ready and stgcn_ready:
+                    break
+                # - metric timeout exceeded and stgcn ready: allow stgcn to proceed
+                if stgcn_ready and elapsed >= metrics_final_wait:
+                    break
+                # - mmaction timeout exceeded and metrics ready
+                if metrics_ready and elapsed >= mmaction_final_wait:
+                    break
+                # - total timeout exceeded (max of both waits)
+                if elapsed >= max(metrics_final_wait, mmaction_final_wait):
+                    break
+
+                time.sleep(interval)
+
+            # merge STGCN response if present
+            try:
+                chosen = resp_pref if resp_pref.exists() else (resp_legacy if resp_legacy.exists() else None)
+                if chosen:
                     try:
-                        resp_txt = resp_path.read_text(encoding='utf-8')
+                        resp_txt = chosen.read_text(encoding='utf-8')
                         resp_obj = json.loads(resp_txt)
                     except Exception:
                         resp_obj = None
@@ -1326,15 +1569,51 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             response_payload['stgcn_inference'] = rj['result']
                         else:
                             response_payload['stgcn_inference'] = resp_obj
-                        # write final job json with inference merged
-                        try:
-                            out_path = Path(dest_dir) / f"{job_id}.json"
-                            _safe_write_json(out_path, response_payload)
-                        except Exception:
-                            pass
             except Exception:
                 pass
 
+            # merge metric_result if present (reuse existing logic above) - re-run merge block to gather late files
+            try:
+                # prefer combined metric_result file
+                metrics_result_path = None
+                for p in Path(dest_dir).iterdir():
+                    if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
+                        metrics_result_path = p
+                        break
+                if metrics_result_path is None:
+                    legacy_mr = Path(dest_dir) / f"{job_id}_metric_result.json"
+                    if legacy_mr.exists():
+                        metrics_result_path = legacy_mr
+                if metrics_result_path and metrics_result_path.exists():
+                    try:
+                        mr = json.loads(metrics_result_path.read_text(encoding='utf-8'))
+                        if isinstance(mr, dict):
+                            for mname, mval in (mr.get('metrics') or mr).items():
+                                try:
+                                    # overwrite or set metric entries with mr content (prefer mr)
+                                    response_payload.setdefault('metrics', {})[mname] = mval
+                                except Exception:
+                                    pass
+                            response_payload['metrics_path'] = str(metrics_result_path)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Finally write the atomic final JSON
+            try:
+                final_path = Path(dest_dir) / f"{result_basename}.json"
+                if not final_path.exists():
+                    final_path = Path(dest_dir) / f"{job_id}.json"
+                _safe_write_json(final_path, response_payload)
+                # remove partial if final written
+                try:
+                    if partial_out_path.exists():
+                        partial_out_path.unlink()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1381,7 +1660,21 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
             except Exception:
                 prefix = None
 
-        local_json = Path(dest_dir) / f"{job_id}.json"
+        # prefer prefixed result basename (dimension_jobid) for the local job json
+        prefixed_json = Path(dest_dir) / f"{os.environ.get('DIM_PREFIX', '')}{job_id}.json"
+        # construct expected prefixed name used by controller: '<dimension>_<job_id>.json'
+        # If caller wants a different prefix logic, set DIM_PREFIX env var; otherwise build from job_id context
+        result_basename = None
+        # try common pattern: '<2d|3d>_jobid.json' in dest_dir
+        cand_prefixed = None
+        for p in Path(dest_dir).iterdir():
+            if p.is_file() and p.name.endswith(f"_{job_id}.json"):
+                cand_prefixed = p
+                break
+        if cand_prefixed:
+            local_json = cand_prefixed
+        else:
+            local_json = Path(dest_dir) / f"{job_id}.json"
         if not local_json.exists():
             raise FileNotFoundError(f'Result file not found: {local_json}')
 
@@ -1416,7 +1709,14 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
         uploaded.append({'local': str(local_json), 'bucket': bucket, 'key': job_key})
 
         # upload combined metrics JSON if produced by metric runner
-        metrics_json_local = Path(dest_dir) / f"{job_id}_metric_result.json"
+        # prefer prefixed metric filename: '<dimension>_<job_id>_metric_result.json'
+        metrics_json_local = None
+        for p in Path(dest_dir).iterdir():
+            if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
+                metrics_json_local = p
+                break
+        if metrics_json_local is None:
+            metrics_json_local = Path(dest_dir) / f"{job_id}_metric_result.json"
         if metrics_json_local.exists():
             if target_prefix:
                 mkey = f"{target_prefix}/{metrics_json_local.name}"
