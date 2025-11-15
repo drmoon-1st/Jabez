@@ -85,6 +85,66 @@ def map_to_binary(pred_idx):
     return 1 if int(pred_idx) >= 2 else 0
 
 
+def map_to_binary_alt(pred_idx):
+    # alternate binary mapping requested by user: {0,1,2} -> 0 ; {3,4} -> 1
+    if pred_idx is None:
+        return None
+    try:
+        v = int(pred_idx)
+    except Exception:
+        return None
+    return 0 if v <= 2 else 1
+
+
+def compute_multiclass_metrics(gt, pred, num_classes=5):
+    # gt and pred are lists of integers (0..num_classes-1) or None for pred
+    # Returns per-class TP/FP/FN/support and overall accuracy (ignoring pred None)
+    from collections import defaultdict
+    assert len(gt) == len(pred)
+    tp = [0] * num_classes
+    fp = [0] * num_classes
+    fn = [0] * num_classes
+    support = [0] * num_classes
+    valid = 0
+    total_correct = 0
+    for g, p in zip(gt, pred):
+        try:
+            gi = None if g is None else int(g)
+        except Exception:
+            gi = None
+        if gi is None or gi < 0 or gi >= num_classes:
+            continue
+        support[gi] += 1
+        if p is None:
+            # count as FN for the true class (prediction missing)
+            fn[gi] += 1
+            continue
+        valid += 1
+        try:
+            pi = int(p)
+        except Exception:
+            # treat as missing
+            fn[gi] += 1
+            continue
+        if pi == gi:
+            tp[gi] += 1
+            total_correct += 1
+        else:
+            fp[pi] += 1
+            fn[gi] += 1
+
+    per_class = []
+    for c in range(num_classes):
+        prec = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) > 0 else 0.0
+        rec = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        per_class.append({'tp': tp[c], 'fp': fp[c], 'fn': fn[c], 'support': support[c], 'precision': prec, 'recall': rec, 'f1': f1})
+
+    accuracy = total_correct / valid if valid > 0 else 0.0
+    summary = {'per_class': per_class, 'valid': valid, 'accuracy': accuracy, 'total_correct': total_correct}
+    return summary
+
+
 def compute_metrics(gt, pred):
     # gt and pred are lists of 0/1 (pred may contain None)
     assert len(gt) == len(pred)
@@ -235,9 +295,21 @@ def main():
 
     # Load ground-truth annotations from test PKL for comparison
     anns, identifier = load_annotations_from_pkl(args.test_pkl, split_name=args.split)
-    gt_labels = [int(a.get('label', 0)) for a in anns]
+    # Map multi-class labels (0..4) to binary using the same mapping as predictions
+    # worst(0), bad(1) -> 0 ; normal(2), good(3), best(4) -> 1
+    gt_raw = [a.get('label', 0) for a in anns]
+    gt_labels = []
+    for v in gt_raw:
+        try:
+            iv = int(v)
+        except Exception:
+            iv = None
+        gt_labels.append(map_to_binary(iv))
     ids = [a.get(identifier) for a in anns]
     print(f"Loaded {len(anns)} annotations from test PKL (identifier={identifier})")
+    # Sanity check: ensure we produced a binary gt list
+    if any(x not in (0,1,None) for x in gt_labels):
+        print("Warning: found ground-truth labels outside expected mapping after binary conversion")
 
     # run test
     try:
@@ -253,23 +325,131 @@ def main():
     with open(result_pkl_path, 'rb') as f:
         result_list = pickle.load(f)
 
-    # parse predictions
-    pred_idx_list = [extract_pred_idx(item) for item in result_list]
-    pred_bin_list = [map_to_binary(p) for p in pred_idx_list]
+    # --- NEW: group DumpResults entries by sample identifier to handle multi-clip test ---
+    from collections import defaultdict
+    grouped = defaultdict(list)
 
-    # compute metrics vs ground truth (note: gt_labels are 0/1)
-    metrics = compute_metrics(gt_labels, pred_bin_list)
+    # Try to detect identifier key used in DumpResults entries
+    # Prefer 'frame_dir' or 'filename' if present, else fall back to index-based mapping
+    for i, item in enumerate(result_list):
+        sid = None
+        for key in ('frame_dir', 'filename', 'id', 'sample_id'):
+            if key in item:
+                sid = item.get(key)
+                break
+        if sid is None:
+            # fallback: use sequential index as key (will be resolved later)
+            sid = f'__idx_{i}'
+        grouped[sid].append(item)
 
-    print('\nEvaluation Summary:')
-    print(json.dumps(metrics, indent=2))
+    # Aggregate per-sample predictions: prefer averaging pred_scores if available,
+    # otherwise majority vote on pred_label/pred_labels
+    agg_pred_idx = {}
+    for sid, items in grouped.items():
+        scores_list = []
+        labels_list = []
+        for it in items:
+            if 'pred_scores' in it and it['pred_scores'] is not None:
+                try:
+                    arr = np.asarray(it['pred_scores'], dtype=float)
+                    scores_list.append(arr)
+                except Exception:
+                    pass
+            elif 'pred_label' in it:
+                try:
+                    labels_list.append(int(it['pred_label']))
+                except Exception:
+                    pass
+            elif 'pred_labels' in it:
+                try:
+                    labels_list.append(int(it['pred_labels']))
+                except Exception:
+                    pass
 
-    # save per-sample CSV
+        if scores_list:
+            mean_scores = np.mean(np.stack(scores_list, axis=0), axis=0)
+            agg_pred_idx[sid] = int(np.argmax(mean_scores))
+        elif labels_list:
+            # majority vote
+            from collections import Counter
+            c = Counter(labels_list)
+            agg_pred_idx[sid] = c.most_common(1)[0][0]
+        else:
+            agg_pred_idx[sid] = None
+
+    # Build pred list aligned with annotations order (ids variable contains identifiers)
+    pred_idx_list = []
+    # Detect whether grouped keys are the sequential fallback keys we created earlier
+    all_seq_keys = all(isinstance(k, str) and k.startswith('__idx_') for k in agg_pred_idx.keys())
+    if all_seq_keys and len(agg_pred_idx) == len(result_list) and len(result_list) == len(ids):
+        # Safe to map sequentially: result_list[i] corresponds to ids[i]
+        pred_idx_list = [agg_pred_idx.get(f'__idx_{i}', None) for i in range(len(ids))]
+        try:
+            import logging
+            logging.getLogger().info('Mapping DumpResults to annotations by sequential index (no identifiers present)')
+        except Exception:
+            pass
+    else:
+        for idv in ids:
+            if idv in agg_pred_idx:
+                pred_idx_list.append(agg_pred_idx[idv])
+            else:
+                # fallback: try to match with simple filename stems
+                found = None
+                for sid in agg_pred_idx:
+                    if isinstance(sid, str) and idv in sid:
+                        found = agg_pred_idx[sid]
+                        break
+                pred_idx_list.append(found)
+
+    # Log some debug examples
+    try:
+        import logging
+        logging.getLogger().info(f"Loaded {len(result_list)} DumpResults entries, grouped into {len(grouped)} samples")
+        sample_keys = list(grouped.keys())[:5]
+        logging.getLogger().info(f"Example grouped keys: {sample_keys}")
+    except Exception:
+        pass
+
+    # Original binary mapping (training mapping) - kept for reference
+    pred_bin_old = [map_to_binary(p) for p in pred_idx_list]
+
+    # --- 1) Full 5-class evaluation ---
+    five_class_summary = compute_multiclass_metrics(gt_raw, pred_idx_list, num_classes=5)
+
+    # --- 2) Alternate binary evaluation requested: {0,1,2} -> 0 ; {3,4} -> 1 ---
+    gt_bin_alt = [map_to_binary_alt(v) for v in gt_raw]
+    pred_bin_alt = [map_to_binary_alt(p) for p in pred_idx_list]
+    binary_alt_metrics = compute_metrics(gt_bin_alt, pred_bin_alt)
+
+    # Print both summaries
+    print('\nFive-class Evaluation Summary:')
+    # produce a compact summary: per-class metrics and overall accuracy/valid
+    # convert per_class list to readable dict
+    fc_out = {
+        'valid_predictions_count': five_class_summary.get('valid'),
+        'accuracy': five_class_summary.get('accuracy'),
+        'per_class': five_class_summary.get('per_class')
+    }
+    print(json.dumps(fc_out, indent=2))
+
+    print('\nAlternate Binary ({0,1,2}->0 ; {3,4}->1) Evaluation Summary:')
+    print(json.dumps(binary_alt_metrics, indent=2))
+
+    # save per-sample CSV including both binary mappings for easier inspection
     out_csv = Path(args.out_csv)
     with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
         writer = csv.writer(csvf)
-        writer.writerow(['id', 'gt_label', 'pred_class_5', 'pred_bin'])
-        for idv, g, p5, pb in zip(ids, gt_labels, pred_idx_list, pred_bin_list):
-            writer.writerow([idv, g, p5 if p5 is not None else '', pb if pb is not None else ''])
+        writer.writerow(['id', 'gt_label_5', 'gt_bin_alt', 'pred_class_5', 'pred_bin_old', 'pred_bin_alt'])
+        for idv, g5, gbin_a, p5, pb_old, pb_alt in zip(ids, gt_raw, gt_bin_alt, pred_idx_list, pred_bin_old, pred_bin_alt):
+            writer.writerow([
+                idv,
+                g5 if g5 is not None else '',
+                gbin_a if gbin_a is not None else '',
+                p5 if p5 is not None else '',
+                pb_old if pb_old is not None else '',
+                pb_alt if pb_alt is not None else ''
+            ])
 
     print(f"Per-sample results written to: {out_csv}")
 

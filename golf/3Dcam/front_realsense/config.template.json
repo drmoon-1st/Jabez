@@ -1,0 +1,9 @@
+{
+  "COGNITO_DOMAIN": "https://your-cognito-domain.auth.region.amazoncognito.com",
+  "CLIENT_ID": "your_cognito_client_id",
+  "REDIRECT_URI": "http://127.0.0.1:5000/callback",
+  "SCOPE": "openid profile",
+  "BACKEND_BASE": "http://localhost:29001"
+}
+
+# 복사하여 config.json으로 저장하고 값들을 채워 사용하세요.

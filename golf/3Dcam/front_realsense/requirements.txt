@@ -1,0 +1,7 @@
+requests
+pyjwt
+pyrealsense2
+numpy
+opencv-python
+pyinstaller
+python-dotenv

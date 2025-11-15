@@ -1,0 +1,185 @@
+"""
+recorder.py
+
+RealsenseRecorder를 기존 예제 파일에서 재사용할 수 있도록 래퍼 제공.
+이 모듈은 프로젝트 루트의 `realsense_pack_and_upload/realsense_pack_and_upload.py`에서
+`RealsenseRecorder`를 임포트 시도합니다.
+"""
+from pathlib import Path
+import threading
+import time
+import traceback
+import json
+
+import numpy as np
+import cv2
+try:
+    import pyrealsense2 as rs
+except Exception:
+    rs = None
+
+
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE_DIR = ROOT / 'realsense_pack_and_upload'
+
+def _try_import_example():
+    try:
+        import sys
+        if str(EXAMPLE_DIR) not in sys.path:
+            sys.path.insert(0, str(EXAMPLE_DIR))
+        import realsense_pack_and_upload as rp
+        return getattr(rp, 'RealsenseRecorder', None)
+    except Exception:
+        return None
+
+
+# If pyrealsense2 is available, provide a local RealsenseRecorder implementation
+if rs is not None:
+    class RealsenseRecorder:
+        def __init__(self, out_dir: Path, width=640, height=480, fps=30):
+            self.out_dir = Path(out_dir)
+            self.width = width
+            self.height = height
+            self.fps = fps
+            self._thread = None
+            self._stop_event = threading.Event()
+            self._running = threading.Event()
+            self._idx = 0
+            # last captured color frame (numpy array) for preview
+            self._last_color = None
+            self._frame_lock = threading.Lock()
+
+        def start(self):
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._running.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            while not self._running.is_set():
+                time.sleep(0.01)
+
+        def stop(self):
+            self._stop_event.set()
+            if self._thread:
+                self._thread.join(timeout=5.0)
+
+        def _run(self):
+            color_dir = self.out_dir / "color"
+            depth_dir = self.out_dir / "depth"
+            color_dir.mkdir(parents=True, exist_ok=True)
+            depth_dir.mkdir(parents=True, exist_ok=True)
+
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+            config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+            align = rs.align(rs.stream.color)
+
+            profile = pipeline.start(config)
+            try:
+                depth_sensor = profile.get_device().first_depth_sensor()
+                depth_scale = depth_sensor.get_depth_scale()
+                intr = None
+                self._running.set()
+                self._idx = 0
+                while not self._stop_event.is_set():
+                    frames = pipeline.wait_for_frames()
+                    frames = align.process(frames)
+                    depth = frames.get_depth_frame()
+                    color = frames.get_color_frame()
+                    if not depth or not color:
+                        continue
+
+                    if intr is None:
+                        try:
+                            ci = color.profile.as_video_stream_profile().intrinsics
+                            intr = {
+                                "width": ci.width,
+                                "height": ci.height,
+                                "fx": float(ci.fx),
+                                "fy": float(ci.fy),
+                                "cx": float(ci.ppx),
+                                "cy": float(ci.ppy),
+                                "coeffs": [float(c) for c in getattr(ci, 'coeffs', [])]
+                            }
+                            meta = {"fps": self.fps, "width": self.width, "height": self.height, "depth_scale": float(depth_scale)}
+                            intr_obj = {"color_intrinsics": intr, "meta": meta}
+                            try:
+                                (self.out_dir / "intrinsics.json").write_text(json.dumps(intr_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+                            except Exception:
+                                pass
+                        except Exception:
+                            intr = None
+
+                    color_img = np.asanyarray(color.get_data())
+                    # update last frame for live preview (thread-safe)
+                    try:
+                        with self._frame_lock:
+                            # store a copy to avoid referencing the underlying buffer
+                            self._last_color = color_img.copy()
+                    except Exception:
+                        pass
+                    depth_raw = np.asanyarray(depth.get_data())
+                    depth_m = (depth_raw.astype(np.float32) * depth_scale)
+
+                    color_path = color_dir / f"{self._idx:06d}.png"
+                    depth_path = depth_dir / f"{self._idx:06d}.npy"
+                    cv2.imwrite(str(color_path), color_img)
+                    np.save(depth_path, depth_m)
+                    self._idx += 1
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                pipeline.stop()
+                self._running.clear()
+                # clear last frame
+                try:
+                    with self._frame_lock:
+                        self._last_color = None
+                except Exception:
+                    pass
+
+else:
+    # fallback: try to import example RealsenseRecorder
+    _Example = _try_import_example()
+    if _Example is not None:
+        RealsenseRecorder = _Example
+    else:
+        RealsenseRecorder = None
+
+
+class RecorderWrapper:
+    def __init__(self, out_dir: str, width=640, height=480, fps=30):
+        if RealsenseRecorder is None:
+            raise RuntimeError('RealSense support not available (pyrealsense2 not installed and example class not found).')
+        self._rec = RealsenseRecorder(Path(out_dir), width=width, height=height, fps=fps)
+
+    def start(self):
+        self._rec.start()
+
+    def stop(self):
+        self._rec.stop()
+
+    def is_running(self):
+        return getattr(self._rec, '_running', None) is not None
+
+    def get_last_frame(self):
+        """Return the most recent color frame (numpy array) or None."""
+        try:
+            lf = getattr(self._rec, '_last_color', None)
+            lock = getattr(self._rec, '_frame_lock', None)
+            if lock is not None:
+                with lock:
+                    return lf.copy() if lf is not None else None
+            else:
+                return lf.copy() if lf is not None else None
+        except Exception:
+            return None
+
+    def frame_count(self):
+        color_dir = Path(self._rec.out_dir) / 'color'
+        if not color_dir.exists():
+            return 0
+        return len(list(color_dir.glob('*.png')))

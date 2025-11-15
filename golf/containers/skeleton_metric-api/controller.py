@@ -749,7 +749,6 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
         response_payload = {
             'message': 'OK',
-            'pose_id': None,
             'people_sequence': people_sequence,
             'frame_count': len(people_sequence)
         }
@@ -964,27 +963,17 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
                 response_payload['metrics'] = cleaned_metrics
 
-                # include path to the saved metrics JSON when available
-                if 'metrics_path' in metrics_res:
-                    response_payload['metrics_path'] = metrics_res.get('metrics_path')
-                else:
-                    # prefer prefixed metric result name '<dimension>_<job_id>_metric_result.json'
-                    prefixed_candidate = None
-                    for p in Path(dest_dir).iterdir():
-                        if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
-                            prefixed_candidate = p
-                            break
-                    if prefixed_candidate and prefixed_candidate.exists():
-                        response_payload['metrics_path'] = str(prefixed_candidate)
-                    else:
-                        legacy_candidate = Path(dest_dir) / f"{job_id}_metric_result.json"
-                        if legacy_candidate.exists():
-                            response_payload['metrics_path'] = str(legacy_candidate)
+                # Note: metrics result file paths are intentionally not injected into the
+                # top-level response payload (consumer expects metrics under 'metrics').
 
                 # overwrite the job json on disk with enriched payload so upload picks it up
                 try:
                     out_path = Path(dest_dir) / f"{job_id}.json"
-                    _safe_write_json(out_path, response_payload)
+                    # Only persist allowed top-level keys in the job JSON to match
+                    # expected consumer schema (avoid injecting extraneous top-level fields).
+                    allowed = ('frame_count', 'dimension', 'skeleton_rows', 'skeleton_columns', 'debug', 'metrics', 'stgcn_inference')
+                    filtered = {k: response_payload[k] for k in allowed if k in response_payload}
+                    _safe_write_json(out_path, filtered)
                 except Exception:
                     traceback.print_exc()
         except Exception:
@@ -1368,7 +1357,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                 except Exception:
                                     pass
                             # ensure metrics_path points to the file we read
-                            response_payload['metrics_path'] = str(metrics_result_path)
+                            # Do not inject metrics_path into final payload; keep metrics under 'metrics'
                     except Exception:
                         pass
             except Exception:
@@ -1600,12 +1589,14 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             except Exception:
                 pass
 
-            # Finally write the atomic final JSON
+            # Finally write the atomic final JSON (filter top-level keys to the allowed set)
             try:
                 final_path = Path(dest_dir) / f"{result_basename}.json"
                 if not final_path.exists():
                     final_path = Path(dest_dir) / f"{job_id}.json"
-                _safe_write_json(final_path, response_payload)
+                allowed = ('frame_count', 'dimension', 'skeleton_rows', 'skeleton_columns', 'debug', 'metrics', 'stgcn_inference')
+                filtered = {k: response_payload[k] for k in allowed if k in response_payload}
+                _safe_write_json(final_path, filtered)
                 # remove partial if final written
                 try:
                     if partial_out_path.exists():
@@ -1633,74 +1624,37 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
 
 def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = None, result_bucket: Optional[str] = None):
-    """Upload the generated <job_id>.json and any overlay videos to the result S3 bucket.
+    """Upload only the canonical job JSON and MP4s under dest_dir/mp4/ to the result S3 bucket.
 
-    If `s3_key` is provided and has the form '<user_id>/<dimension>/.../<job_id_or_filename>',
-    we upload to the same prefix '<user_id>/<dimension>/' with filenames like '<job_id>.json' and
-    overlay files named '<job_id><overlay_suffix>.mp4'. If `s3_key` is not provided we fall back
-    to key 'results/<job_id>.json'.
+    Behavior:
+    - Upload dest_dir/{job_id}.json (or raise if missing)
+    - Upload files under dest_dir/mp4/*.mp4 only
+    - When s3_key is provided and looks like '<user>/<dimension>/...': upload under
+      '{user}/{dimension}/{job_id}/' preserving filenames (JSON at prefix root, MP4s under prefix/mp4/)
+    - Otherwise upload under 'results/' with same structure (results/{job_id}.json and results/mp4/{fname})
+    - Default bucket if not provided: 'golf-result-s3'
     """
     try:
-        # determine result bucket from environment
-        bucket = result_bucket or os.environ.get('S3_RESULT_BUCKET_NAME') or os.environ.get('RESULT_S3_BUCKET')
-        if not bucket:
-            raise RuntimeError('S3_RESULT_BUCKET_NAME (or RESULT_S3_BUCKET) not configured')
-
+        bucket = result_bucket or os.environ.get('S3_RESULT_BUCKET_NAME') or os.environ.get('RESULT_S3_BUCKET') or 'golf-result-s3'
         s3 = boto3.client('s3')
 
-        # Determine S3 prefix from s3_key when possible
-        prefix = None
-        if s3_key:
-            try:
-                k = s3_key.lstrip('/')
-                parts = k.split('/')
-                if len(parts) >= 2:
-                    # user_id/dimension prefix
-                    prefix = f"{parts[0]}/{parts[1]}"
-            except Exception:
-                prefix = None
-
-        # prefer prefixed result basename (dimension_jobid) for the local job json
-        prefixed_json = Path(dest_dir) / f"{os.environ.get('DIM_PREFIX', '')}{job_id}.json"
-        # construct expected prefixed name used by controller: '<dimension>_<job_id>.json'
-        # If caller wants a different prefix logic, set DIM_PREFIX env var; otherwise build from job_id context
-        result_basename = None
-        # try common pattern: '<2d|3d>_jobid.json' in dest_dir
-        cand_prefixed = None
-        for p in Path(dest_dir).iterdir():
-            if p.is_file() and p.name.endswith(f"_{job_id}.json"):
-                cand_prefixed = p
-                break
-        if cand_prefixed:
-            local_json = cand_prefixed
-        else:
-            local_json = Path(dest_dir) / f"{job_id}.json"
-        if not local_json.exists():
-            raise FileNotFoundError(f'Result file not found: {local_json}')
-
-        uploaded = []
-
-        # Build a more specific target prefix: prefer user/dimension/<input_stem>/ if s3_key provided
         target_prefix = None
         if s3_key:
             try:
                 k = s3_key.lstrip('/')
                 parts = k.split('/')
-                if len(parts) >= 3:
-                    # parts: [user, dimension, ..., filename]
-                    # use user/dimension/<input_stem> where input_stem is filename without extension
-                    input_fn = parts[-1]
-                    stem = Path(input_fn).stem
-                    target_prefix = f"{parts[0]}/{parts[1]}/{stem}"
-                elif len(parts) == 2:
-                    # user/dimension only
-                    target_prefix = f"{parts[0]}/{parts[1]}"
-                else:
-                    target_prefix = None
+                if len(parts) >= 2:
+                    # user/dimension/job_id
+                    target_prefix = f"{parts[0]}/{parts[1]}/{job_id}"
             except Exception:
                 target_prefix = None
 
-        # Upload job json itself into the target prefix (so result.json sits at prefix root)
+        # canonical job json only
+        local_json = Path(dest_dir) / f"{job_id}.json"
+        if not local_json.exists():
+            raise FileNotFoundError(f'Result file not found: {local_json}')
+
+        uploaded = []
         if target_prefix:
             job_key = f"{target_prefix}/{local_json.name}"
         else:
@@ -1708,43 +1662,17 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
         s3.upload_file(str(local_json), bucket, job_key)
         uploaded.append({'local': str(local_json), 'bucket': bucket, 'key': job_key})
 
-        # upload combined metrics JSON if produced by metric runner
-        # prefer prefixed metric filename: '<dimension>_<job_id>_metric_result.json'
-        metrics_json_local = None
-        for p in Path(dest_dir).iterdir():
-            if p.is_file() and p.name.endswith(f"_{job_id}_metric_result.json"):
-                metrics_json_local = p
-                break
-        if metrics_json_local is None:
-            metrics_json_local = Path(dest_dir) / f"{job_id}_metric_result.json"
-        if metrics_json_local.exists():
-            if target_prefix:
-                mkey = f"{target_prefix}/{metrics_json_local.name}"
-            else:
-                mkey = f"results/{metrics_json_local.name}"
-            s3.upload_file(str(metrics_json_local), bucket, mkey)
-            uploaded.append({'local': str(metrics_json_local), 'bucket': bucket, 'key': mkey})
-
-        # upload any overlay mp4 files found in dest_dir
-        # overlay filenames convention: either '{job_id}*.mp4' or '*.mp4' in dest_dir
-        mp4_candidates = list(Path(dest_dir).glob(f"{job_id}*.mp4"))
-        if not mp4_candidates:
-            # fallback: all mp4s in dest_dir
-            mp4_candidates = list(Path(dest_dir).glob("*.mp4"))
-
-        for mp in mp4_candidates:
-            fname = mp.name
-            # place mp4s under <prefix>/mp4/<fname> so overlay_mp4 paths like 'mp4/<fname>' resolve inside the prefix
-            if target_prefix:
-                key = f"{target_prefix}/mp4/{fname}"
-            elif prefix:
-                # older behavior: use user/dimension
-                key = f"{prefix}/{fname}"
-            else:
-                key = f"results/{fname}"
-            # ensure the mp4/ prefix exists in key path (S3 is flat; this just sets key)
-            s3.upload_file(str(mp), bucket, key)
-            uploaded.append({'local': str(mp), 'bucket': bucket, 'key': key})
+        # only mp4s under dest_dir/mp4/
+        mp4_dir = Path(dest_dir) / 'mp4'
+        if mp4_dir.exists() and mp4_dir.is_dir():
+            for mp in sorted(mp4_dir.glob('*.mp4')):
+                fname = mp.name
+                if target_prefix:
+                    key = f"{target_prefix}/mp4/{fname}"
+                else:
+                    key = f"results/mp4/{fname}"
+                s3.upload_file(str(mp), bucket, key)
+                uploaded.append({'local': str(mp), 'bucket': bucket, 'key': key})
 
         return {'message': 'UPLOADED', 'files': uploaded}
     except Exception as e:

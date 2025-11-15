@@ -16,6 +16,12 @@ from fastapi import Header, Cookie
 COGNITO_REGION = os.getenv("COGNITO_REGION")
 COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
+# 허용할 클라이언트 ID 목록 (콤마로 구분). 기본값은 `CLIENT_ID` 하나만 허용.
+_ALLOWED_CLIENT_IDS_RAW = os.getenv("ALLOWED_CLIENT_IDS")
+if _ALLOWED_CLIENT_IDS_RAW:
+    ALLOWED_CLIENT_IDS = [c.strip() for c in _ALLOWED_CLIENT_IDS_RAW.split(",") if c.strip()]
+else:
+    ALLOWED_CLIENT_IDS = [CLIENT_ID] if CLIENT_ID else []
 
 # 우선순위: 직접 지정(오버라이드)된 ISSUER/JWKS_URL 사용 가능
 COGNITO_ISSUER = os.getenv("COGNITO_ISSUER")
@@ -91,7 +97,7 @@ def _verify_signature(token: str) -> dict:
     claims = jwt.get_unverified_claims(token)
     return claims
 
-def _validate_claims(claims: dict, audience: Optional[str] = None) -> None:
+def _validate_claims(claims: dict, audiences: Optional[list] = None) -> None:
     now = int(time.time())
     exp = claims.get("exp")
     if exp is None or int(exp) < now:
@@ -103,33 +109,39 @@ def _validate_claims(claims: dict, audience: Optional[str] = None) -> None:
             raise JWTError(f"iss 검증 실패 (got={iss} expected={ISSUER})")
 
     token_use = claims.get("token_use")  # 'id' 또는 'access' (Cognito)
+    # audiences가 제공되지 않으면 전역 ALLOWED_CLIENT_IDS 사용
+    if audiences is None:
+        audiences = ALLOWED_CLIENT_IDS
+
+    def _audience_matches(value):
+        if not value:
+            return False
+        if isinstance(value, list):
+            return any(v in audiences for v in value)
+        return value in audiences
+
     if token_use == "id":
         aud = claims.get("aud")
-        if audience:
-            if isinstance(aud, list):
-                if audience not in aud:
-                    raise JWTError(f"aud 검증 실패 (id_token) aud={aud}")
-            else:
-                if aud != audience:
-                    raise JWTError(f"aud 검증 실패 (id_token) aud={aud}")
+        if audiences:
+            if not _audience_matches(aud):
+                raise JWTError(f"aud 검증 실패 (id_token) aud={aud} allowed={audiences}")
     elif token_use == "access":
         # access_token은 client_id 클레임을 사용하는 경우가 많음
         client_id_claim = claims.get("client_id")
         aud_claim = claims.get("aud")
-        if audience:
+        if audiences:
             if client_id_claim:
-                if client_id_claim != audience:
-                    raise JWTError(f"client_id 검증 실패 (access_token) client_id={client_id_claim}")
+                if client_id_claim not in audiences:
+                    raise JWTError(f"client_id 검증 실패 (access_token) client_id={client_id_claim} allowed={audiences}")
             elif aud_claim:
-                # 일부 설정에서 aud는 resource 서버 식별자일 수 있음 — 필요 시 허용/조정
-                if aud_claim != audience:
-                    raise JWTError(f"aud 검증 실패 (access_token) aud={aud_claim}")
+                if aud_claim not in audiences:
+                    raise JWTError(f"aud 검증 실패 (access_token) aud={aud_claim} allowed={audiences}")
             else:
                 raise JWTError("access_token에 client_id/aud가 없어 검증 불가")
     else:
         aud = claims.get("aud")
-        if audience and aud and aud != audience:
-            raise JWTError(f"aud 검증 실패 (unknown token_use) aud={aud}")
+        if audiences and aud and (not _audience_matches(aud)):
+            raise JWTError(f"aud 검증 실패 (unknown token_use) aud={aud} allowed={audiences}")
 
 def get_current_user_id(
     Authorization: Optional[str] = Header(None, alias="Authorization"),
@@ -154,7 +166,7 @@ def get_current_user_id(
     try:
         claims = _verify_signature(token)
         # audience 검증은 token_use에 따라 유동적으로 수행
-        _validate_claims(claims, audience=CLIENT_ID if CLIENT_ID else None)
+        _validate_claims(claims, audiences=ALLOWED_CLIENT_IDS if ALLOWED_CLIENT_IDS else None)
         user_id = claims.get("sub")
         if not user_id:
             raise JWTError("토큰에 sub가 없습니다.")
@@ -175,7 +187,7 @@ def get_user_id_from_token(token: Optional[str]) -> Optional[str]:
         token = token.split(" ", 1)[1]
     try:
         claims = _verify_signature(token)
-        _validate_claims(claims, audience=CLIENT_ID if CLIENT_ID else None)
+        _validate_claims(claims, audiences=ALLOWED_CLIENT_IDS if ALLOWED_CLIENT_IDS else None)
         return claims.get("sub")
     except JWTError as e:
         print(f"JWT 검증 실패 (token helper): {e}")

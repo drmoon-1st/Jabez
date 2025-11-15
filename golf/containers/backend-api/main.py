@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware # CORS 임포트
 from app.routers import upload_router
 from app.routers import token_router
 from app.routers import result_router
+from app.routers import auth_router
 
 
 
@@ -25,6 +26,7 @@ app = FastAPI(
 origins = [
     "http://localhost:29000",
     "http://127.0.0.1:29000",
+    "http://localhost:5000",
 ]
 
 app.add_middleware(
@@ -48,6 +50,8 @@ app.include_router(upload_router.router, prefix="/api")
  
 # result_router.py의 prefix=/result와 결합 -> 최종 경로: /api/result
 app.include_router(result_router.router, prefix="/api") 
+# auth router for backend-mediated login
+app.include_router(auth_router.router, prefix="/api")
 
 @app.get("/")
 def read_root():

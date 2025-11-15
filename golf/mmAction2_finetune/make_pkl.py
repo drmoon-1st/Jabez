@@ -21,6 +21,11 @@ ratio can be provided to hold out a subset for xsub_val.
 """
 
 from pathlib import Path
+# static-trim utilities (required)
+try:
+    from module import trim_static_frames
+except Exception as e:
+    raise ImportError("static_trim module not found or failed to import. Ensure 'module/static_trim.py' exists and is importable.\nOriginal error: {}".format(e))
 import argparse
 import pickle
 import pandas as pd
@@ -125,6 +130,17 @@ def csv_to_annotation(csv_path: Path, frame_dir: str, label: int, img_shape=(108
 
     keypoint = np.stack([np.array(f) for f in frames], axis=0)  # (T, V, 2)
 
+    # --- Static-trim: remove leading/trailing static frames conservatively ---
+    # This trim is always executed; if it fails we log a warning and keep the
+    # untrimmed sequence to avoid dropping data.
+    try:
+        start_idx, end_idx = trim_static_frames(keypoint, fps=30)
+        # slice and ensure we still have frames
+        if start_idx > 0 or end_idx < (keypoint.shape[0] - 1):
+            keypoint = keypoint[start_idx:(end_idx + 1)]
+    except Exception as e:
+        print(f"[WARN] static trimming failed for {csv_path}: {e}")
+
     # optional normalization applied on the whole array
     if normalize_method == '0to1':
         h, w = img_shape
@@ -166,7 +182,8 @@ def detect_label_from_path(p: Path):
 
 
 def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
-                     normalize_method='0to1', val_ratio: float = 0.0, seed: int = 42):
+                     normalize_method='0to1', val_ratio: float = 0.0, seed: int = 42,
+                     test_mode: bool = False):
     csv_root = Path(csv_root)
     # Instead of scanning the entire tree, only look under the expected
     # evaluation folders (true/false) and the five labels under them. For
@@ -339,15 +356,20 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
     # optional train/val split
     random.seed(seed)
     indices = list(range(len(annotations)))
-    if val_ratio > 0.0:
-        random.shuffle(indices)
-        k = int(len(indices) * val_ratio)
-        val_idx = set(indices[:k])
-        train_dirs = [annotations[i]['frame_dir'] for i in indices if i not in val_idx]
-        val_dirs = [annotations[i]['frame_dir'] for i in indices if i in val_idx]
-        split = {'xsub_train': train_dirs, 'xsub_val': val_dirs}
+    if test_mode:
+        # In test mode, follow makePkl_forFintuning convention: put all samples
+        # into the validation split only (xsub_val).
+        split = {'xsub_val': [a['frame_dir'] for a in annotations]}
     else:
-        split = {'xsub_train': [a['frame_dir'] for a in annotations]}
+        if val_ratio > 0.0:
+            random.shuffle(indices)
+            k = int(len(indices) * val_ratio)
+            val_idx = set(indices[:k])
+            train_dirs = [annotations[i]['frame_dir'] for i in indices if i not in val_idx]
+            val_dirs = [annotations[i]['frame_dir'] for i in indices if i in val_idx]
+            split = {'xsub_train': train_dirs, 'xsub_val': val_dirs}
+        else:
+            split = {'xsub_train': [a['frame_dir'] for a in annotations]}
 
     combined = {
         'split': split,
@@ -370,11 +392,13 @@ def cli():
                         help='whether to normalize keypoints to 0..1 (default: none)')
     parser.add_argument('--val-ratio', type=float, default=0.0, help='holdout ratio for xsub_val')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--test', action='store_true', help='Write test PKL: place all samples into xsub_val only')
     args = parser.parse_args()
 
     h, w = [int(x) for x in args.img_shape.split(',')]
     collect_and_make(Path(args.csv_root), Path(args.out), img_shape=(h, w),
-                     normalize_method=args.normalize, val_ratio=args.val_ratio, seed=args.seed)
+                     normalize_method=args.normalize, val_ratio=args.val_ratio, seed=args.seed,
+                     test_mode=bool(args.test))
 
 
 if __name__ == '__main__':

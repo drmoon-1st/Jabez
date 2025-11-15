@@ -14,8 +14,8 @@ router = APIRouter(
 COGNITO_DOMAIN_URL = os.getenv("COGNITO_DOMAIN_URL")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-# Next.js의 콜백 URL과 일치해야 합니다.
-REDIRECT_URI = "http://localhost:29000/callback" 
+# Next.js의 콜백 URL과 일치해야 합니다. .env의 REDIRECT_URI_FRONTEND로 설정하세요.
+REDIRECT_URI = os.getenv("REDIRECT_URI_FRONTEND") or "http://localhost:29000/callback"
 
 
 @router.post("/")

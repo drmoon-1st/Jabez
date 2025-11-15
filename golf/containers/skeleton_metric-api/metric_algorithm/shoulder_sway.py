@@ -333,27 +333,13 @@ def run_from_context(ctx: dict):
                 # don't leak internal overlay lookup failures in return shape
                 wide2 = None
 
-        # If we have 2D overlay data, try to render
+         # If we have 2D overlay data, try to render
         if wide2 is not None:
             try:
                 img_dir = Path(ctx.get('img_dir', dest))
                 lm = ctx.get('landmarks', {}) or {}
                 # Create both job-specific overlay and canonical analysis name for compatibility
                 overlay_sway(img_dir, wide2, overlay_path, fps, 'mp4v', lm)
-                # Also try to copy/duplicate to canonical CLI filename in dest
-                try:
-                    canonical = dest / 'shoulder_sway_analysis.mp4'
-                    try:
-                        import shutil as _sh
-                        _sh.copy2(str(overlay_path), str(canonical))
-                    except Exception:
-                        # if copy fails, try rename
-                        try:
-                            overlay_path.replace(canonical)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
                 return {'overlay_mp4': str(overlay_path)}
             except Exception:
                 # fall through to trying to find existing rendered files

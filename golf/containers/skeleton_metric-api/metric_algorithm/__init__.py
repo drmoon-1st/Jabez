@@ -237,35 +237,38 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 			out['metrics'][name] = {'error': _tb.format_exc()}
 
 	# Attempt to upload any overlay mp4s produced by metric modules to the result S3 bucket
+	# NOTE: Disabled by default to avoid uploading metric overlays at top-level.
+	# To enable overlay uploads from metric runner set env var METRIC_UPLOAD_OVERLAYS=1
 	try:
-		bucket = os.environ.get('S3_RESULT_BUCKET_NAME') or os.environ.get('RESULT_S3_BUCKET')
-		if bucket:
-			s3 = boto3.client('s3')
-			uploaded = []
-			for name in out['metrics'].keys():
-				try:
-					# metric may include overlay path
-					m = out['metrics'].get(name) or {}
-					local_overlay = None
-					if isinstance(m, dict) and 'overlay_mp4' in m:
-						local_overlay = m.get('overlay_mp4')
-					else:
-						# try conventional name
-						cand = dest_dir / f"{job_id}_{name}_overlay.mp4"
-						if cand.exists():
-							local_overlay = str(cand)
-					if local_overlay and Path(local_overlay).exists():
-						key = f"{job_id}_{name}_overlay.mp4"
-						s3.upload_file(str(local_overlay), bucket, key)
-						uploaded.append({'local': str(local_overlay), 'bucket': bucket, 'key': key})
-						# record S3 location in out metrics
-						if isinstance(m, dict):
-							m['overlay_s3'] = {'bucket': bucket, 'key': key}
-				except Exception:
-					# non-fatal
-					continue
-			if uploaded:
-				out['uploaded_overlays'] = uploaded
+		if os.environ.get('METRIC_UPLOAD_OVERLAYS', '0') == '1':
+			bucket = os.environ.get('S3_RESULT_BUCKET_NAME') or os.environ.get('RESULT_S3_BUCKET')
+			if bucket:
+				s3 = boto3.client('s3')
+				uploaded = []
+				for name in out['metrics'].keys():
+					try:
+						# metric may include overlay path
+						m = out['metrics'].get(name) or {}
+						local_overlay = None
+						if isinstance(m, dict) and 'overlay_mp4' in m:
+							local_overlay = m.get('overlay_mp4')
+						else:
+							# try conventional name
+							cand = dest_dir / f"{job_id}_{name}_overlay.mp4"
+							if cand.exists():
+								local_overlay = str(cand)
+						if local_overlay and Path(local_overlay).exists():
+							key = f"{job_id}_{name}_overlay.mp4"
+							s3.upload_file(str(local_overlay), bucket, key)
+							uploaded.append({'local': str(local_overlay), 'bucket': bucket, 'key': key})
+							# record S3 location in out metrics
+							if isinstance(m, dict):
+								m['overlay_s3'] = {'bucket': bucket, 'key': key}
+					except Exception:
+						# non-fatal
+						continue
+				if uploaded:
+					out['uploaded_overlays'] = uploaded
 	except Exception:
 		out['overlay_upload_error'] = _tb.format_exc()
 

@@ -1,0 +1,4 @@
+openpose_processing/video_crop.py 명령어
+
+-테스트용
+python .\openpose_processing\video_crop.py --class test --verbose
