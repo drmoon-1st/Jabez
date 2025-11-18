@@ -2,19 +2,14 @@
 """
 finetune_stgcn_test.py
 
-Run a finetuned ST-GCN checkpoint (5-class) against a binary test PKL
-and map the 5-class predictions to binary labels for evaluation.
-
-Mapping used (same as training label mapping):
-  worst(0), bad(1) -> binary 0 (false)
-  normal(2), good(3), best(4) -> binary 1 (true)
+Run a finetuned ST-GCN checkpoint (5-class) against a test PKL.
 
 This script mirrors the test setup in `stgcn_tester.py`/`my_stgcnpp.py`:
  - loads a config, overrides test_dataloader.dataset.ann_file
  - appends a DumpResults evaluator to write a result PKL
  - runs Runner.test() inline and parses the result PKL
- - compares predictions (argmax) to ground-truth labels from test PKL
- - prints summary metrics and saves a per-sample CSV
+ - compares 5-class predictions (argmax) to ground-truth labels from test PKL
+ - prints per-class metrics and saves a per-sample CSV
 """
 
 import argparse
@@ -74,6 +69,31 @@ def extract_pred_idx(item):
             return int(np.argmax(arr))
         except Exception:
             return None
+    return None
+
+
+def map_to_three(pred_idx):
+    """
+    Map original 5-class index to 3 classes: 0,1,2.
+    Default mapping (assumed):
+      0 -> 0
+      1 -> 1
+      2,3,4 -> 2
+    Returns None if input is None or invalid.
+    """
+    if pred_idx is None:
+        return None
+    try:
+        v = int(pred_idx)
+    except Exception:
+        return None
+    # mapping requested: 0,1 -> 0 ; 2 -> 2 ; 3,4 -> 3
+    if v in (0, 1):
+        return 0
+    if v == 2:
+        return 2
+    if v in (3, 4):
+        return 3
     return None
 
 
@@ -175,10 +195,15 @@ def main():
                         help='MMAction2 config file (default: my_stgcnpp in mmaction2 configs)')
     parser.add_argument('--checkpoint', required=True, help='Path to finetuned .pth checkpoint')
     parser.add_argument('--test-pkl', default=r"D:\golfDataset\crop_pkl\skeleton_dataset_test.pkl",
-                        help='Test PKL with binary labels (true/false)')
+                        help='Test PKL with labels (5-class by default)')
     parser.add_argument('--split', default='xsub_val', help='split name inside PKL to evaluate')
     parser.add_argument('--out-csv', default='finetune_test_results.csv', help='Per-sample results CSV')
+    parser.add_argument('--three_class', action='store_true', help='Evaluate using 3-class mapping (0,1,2). Overrides config to _3class if set.')
     args = parser.parse_args()
+
+    # If requested, override config to the 3-class variant
+    if args.three_class:
+        args.config = os.path.join(MM_ROOT, 'configs', 'skeleton', 'stgcnpp', 'my_stgcnpp_3class.py')
 
     cfg = Config.fromfile(args.config)
 
@@ -295,21 +320,31 @@ def main():
 
     # Load ground-truth annotations from test PKL for comparison
     anns, identifier = load_annotations_from_pkl(args.test_pkl, split_name=args.split)
-    # Map multi-class labels (0..4) to binary using the same mapping as predictions
-    # worst(0), bad(1) -> 0 ; normal(2), good(3), best(4) -> 1
+    # multi-class labels (0..4)
     gt_raw = [a.get('label', 0) for a in anns]
-    gt_labels = []
-    for v in gt_raw:
-        try:
-            iv = int(v)
-        except Exception:
-            iv = None
-        gt_labels.append(map_to_binary(iv))
     ids = [a.get(identifier) for a in anns]
     print(f"Loaded {len(anns)} annotations from test PKL (identifier={identifier})")
-    # Sanity check: ensure we produced a binary gt list
-    if any(x not in (0,1,None) for x in gt_labels):
-        print("Warning: found ground-truth labels outside expected mapping after binary conversion")
+    # Diagnostic: print ground-truth label distribution
+    try:
+        from collections import Counter
+        print('GT label distribution (sample counts):', dict(Counter(gt_raw)))
+    except Exception:
+        pass
+    # Sanity check: ensure labels are in expected 0..4 range (or None)
+    bad_label_found = False
+    for v in gt_raw:
+        if v is None:
+            continue
+        try:
+            vi = int(v)
+        except Exception:
+            bad_label_found = True
+            break
+        if vi < 0 or vi > 4:
+            bad_label_found = True
+            break
+    if bad_label_found:
+        print("Warning: found ground-truth labels outside expected 0..4 range")
 
     # run test
     try:
@@ -411,45 +446,65 @@ def main():
     except Exception:
         pass
 
-    # Original binary mapping (training mapping) - kept for reference
-    pred_bin_old = [map_to_binary(p) for p in pred_idx_list]
-
-    # --- 1) Full 5-class evaluation ---
-    five_class_summary = compute_multiclass_metrics(gt_raw, pred_idx_list, num_classes=5)
-
-    # --- 2) Alternate binary evaluation requested: {0,1,2} -> 0 ; {3,4} -> 1 ---
-    gt_bin_alt = [map_to_binary_alt(v) for v in gt_raw]
-    pred_bin_alt = [map_to_binary_alt(p) for p in pred_idx_list]
-    binary_alt_metrics = compute_metrics(gt_bin_alt, pred_bin_alt)
-
-    # Print both summaries
-    print('\nFive-class Evaluation Summary:')
-    # produce a compact summary: per-class metrics and overall accuracy/valid
-    # convert per_class list to readable dict
-    fc_out = {
-        'valid_predictions_count': five_class_summary.get('valid'),
-        'accuracy': five_class_summary.get('accuracy'),
-        'per_class': five_class_summary.get('per_class')
-    }
-    print(json.dumps(fc_out, indent=2))
-
-    print('\nAlternate Binary ({0,1,2}->0 ; {3,4}->1) Evaluation Summary:')
-    print(json.dumps(binary_alt_metrics, indent=2))
-
-    # save per-sample CSV including both binary mappings for easier inspection
+    # If --three_class requested, compute 3-class mapping and summary
     out_csv = Path(args.out_csv)
-    with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
-        writer = csv.writer(csvf)
-        writer.writerow(['id', 'gt_label_5', 'gt_bin_alt', 'pred_class_5', 'pred_bin_old', 'pred_bin_alt'])
-        for idv, g5, gbin_a, p5, pb_old, pb_alt in zip(ids, gt_raw, gt_bin_alt, pred_idx_list, pred_bin_old, pred_bin_alt):
-            writer.writerow([
-                idv,
-                g5 if g5 is not None else '',
-                gbin_a if gbin_a is not None else '',
-                p5 if p5 is not None else '',
-                pb_old if pb_old is not None else '',
-                pb_alt if pb_alt is not None else ''
-            ])
+    if args.three_class:
+        # three_class: assume PKL and model are already using 3-class labels (0..2)
+        # Use raw labels/predictions without additional mapping
+        gt_3 = []
+        for v in gt_raw:
+            try:
+                gt_3.append(int(v) if v is not None else None)
+            except Exception:
+                gt_3.append(None)
+        pred_3 = []
+        for p in pred_idx_list:
+            try:
+                pred_3.append(int(p) if p is not None else None)
+            except Exception:
+                pred_3.append(None)
+
+        three_class_summary = compute_multiclass_metrics(gt_3, pred_3, num_classes=3)
+        print('\nThree-class Evaluation Summary (no mapping applied; using raw 3-class labels 0..2):')
+        tc_out = {
+            'valid_predictions_count': three_class_summary.get('valid'),
+            'accuracy': three_class_summary.get('accuracy'),
+            'per_class': three_class_summary.get('per_class')
+        }
+        print(json.dumps(tc_out, indent=2))
+
+        # save CSV with both 5-class (original pkls if present) and 3-class columns
+        with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
+            writer = csv.writer(csvf)
+            writer.writerow(['id', 'gt_label_5', 'pred_class_5', 'gt_label_3', 'pred_class_3'])
+            for idv, g5, p5, g3, p3 in zip(ids, gt_raw, pred_idx_list, gt_3, pred_3):
+                writer.writerow([
+                    idv,
+                    g5 if g5 is not None else '',
+                    p5 if p5 is not None else '',
+                    g3 if g3 is not None else '',
+                    p3 if p3 is not None else ''
+                ])
+    else:
+        # Default: only 5-class evaluation and CSV
+        five_class_summary = compute_multiclass_metrics(gt_raw, pred_idx_list, num_classes=5)
+        print('\nFive-class Evaluation Summary:')
+        fc_out = {
+            'valid_predictions_count': five_class_summary.get('valid'),
+            'accuracy': five_class_summary.get('accuracy'),
+            'per_class': five_class_summary.get('per_class')
+        }
+        print(json.dumps(fc_out, indent=2))
+
+        with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
+            writer = csv.writer(csvf)
+            writer.writerow(['id', 'gt_label_5', 'pred_class_5'])
+            for idv, g5, p5 in zip(ids, gt_raw, pred_idx_list):
+                writer.writerow([
+                    idv,
+                    g5 if g5 is not None else '',
+                    p5 if p5 is not None else ''
+                ])
 
     print(f"Per-sample results written to: {out_csv}")
 

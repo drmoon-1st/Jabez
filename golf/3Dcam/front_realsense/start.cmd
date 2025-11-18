@@ -1,0 +1,3 @@
+python ui.py
+
+exit

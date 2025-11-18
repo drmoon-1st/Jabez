@@ -33,6 +33,41 @@ import numpy as np
 from tqdm import tqdm
 import random
 import sys
+from collections import Counter # Counter는 사용되지 않지만, 다른 진단 목적으로 유용할 수 있음
+
+
+def stratified_split_annotations(annotations, val_ratio, seed=42):
+    """Return train_indices, val_indices using a stratified split by 'label'.
+
+    For each label, select approx. val_ratio fraction of its indices.
+    If val_ratio>0 and a label has at least one sample, at least one sample
+    will be selected for validation for that label to ensure coverage.
+    """
+    from collections import defaultdict
+    import random
+
+    label_to_indices = defaultdict(list)
+    for idx, ann in enumerate(annotations):
+        label = ann.get('label')
+        label_to_indices[label].append(idx)
+
+    val_indices = set()
+    random.seed(seed)
+    for label, idxs in label_to_indices.items():
+        if not idxs:
+            continue
+        k = int(len(idxs) * val_ratio)
+        # ensure at least one sample per class in val if val_ratio>0
+        if k == 0 and val_ratio > 0:
+            k = 1
+        k = min(k, len(idxs))
+        if k > 0:
+            sampled = random.sample(idxs, k)
+            val_indices.update(sampled)
+
+    train_indices = [i for i in range(len(annotations)) if i not in val_indices]
+    val_indices = sorted(list(val_indices))
+    return train_indices, val_indices
 
 
 def csv_to_annotation(csv_path: Path, frame_dir: str, label: int, img_shape=(1080, 1920),
@@ -128,7 +163,7 @@ def csv_to_annotation(csv_path: Path, frame_dir: str, label: int, img_shape=(108
     if len(frames) == 0:
         return None
 
-    keypoint = np.stack([np.array(f) for f in frames], axis=0)  # (T, V, 2)
+    keypoint = np.stack([np.array(f) for f in frames], axis=0)    # (T, V, 2)
 
     # --- Static-trim: remove leading/trailing static frames conservatively ---
     # This trim is always executed; if it fails we log a warning and keep the
@@ -161,16 +196,30 @@ def csv_to_annotation(csv_path: Path, frame_dir: str, label: int, img_shape=(108
     return ann
 
 
-def detect_label_from_path(p: Path):
-    # Support multi-class evaluation labels found in path components.
-    # Expected evaluation folders: best, good, normal, bad, worst
-    mapping = {
+def detect_label_from_path(p: Path, three_class_mode: bool = False):
+    """
+    경로에서 레이블을 감지하고, three_class_mode에 따라 레이블을 매핑합니다.
+    """
+    # 5-class mapping
+    mapping_5c = {
         'worst': 0,
         'bad': 1,
         'normal': 2,
         'good': 3,
         'best': 4,
     }
+    
+    # 3-class mapping: 0: Bad (worst, bad), 1: Normal, 2: Good (good, best)
+    mapping_3c_012 = { # 0, 1, 2 매핑 (수정됨)
+        'worst': 0,
+        'bad': 0,
+        'normal': 1,
+        'good': 2,
+        'best': 2,
+    }
+    
+    mapping = mapping_3c_012 if three_class_mode else mapping_5c
+    
     parts = [s.lower() for s in p.parts]
     # prefer explicit evaluation labels if present anywhere in the path
     for name, lab in mapping.items():
@@ -178,12 +227,13 @@ def detect_label_from_path(p: Path):
             return lab
 
     # default: unknown -> assign 'normal' (middle class)
-    return 2
+    # 3-class: 1, 5-class: 2
+    return 1 if three_class_mode else 2
 
 
 def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
                      normalize_method='0to1', val_ratio: float = 0.0, seed: int = 42,
-                     test_mode: bool = False):
+                     test_mode: bool = False, three_class_mode: bool = False):
     csv_root = Path(csv_root)
     # Instead of scanning the entire tree, only look under the expected
     # evaluation folders (true/false) and the five labels under them. For
@@ -227,25 +277,30 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
     all_csvs = sorted(all_csvs)
     print(f"Found {len(all_csvs)} CSV files under selected skeleton_crop folders of {csv_root}")
 
-    annotations = []
+    annotations_5c = [] # 5-class label을 저장할 임시 리스트
     samples = []
+    
+    # 5-class 레이블 매핑 (파일 경로에서 감지된 원래 레이블)
+    mapping_5c = {
+        'worst': 0,
+        'bad': 1,
+        'normal': 2,
+        'good': 3,
+        'best': 4,
+    }
+    
     for csv in tqdm(all_csvs, desc="Processing CSVs", unit="file"):
         # Determine label from the path: expect one of the target labels to be
         # in the ancestry. If not found, fall back to detect_label_from_path.
         parts = [s.lower() for s in csv.parts]
-        label = None
-        for name, lab in {
-            'worst': 0,
-            'bad': 1,
-            'normal': 2,
-            'good': 3,
-            'best': 4,
-        }.items():
+        label_5c = None # 5-class 레이블
+        for name, lab in mapping_5c.items():
             if name in parts:
-                label = lab
+                label_5c = lab
                 break
-        if label is None:
-            label = detect_label_from_path(csv)
+        if label_5c is None:
+            # detect_label_from_path를 5-class 모드로 호출하여 기본값(2)을 얻습니다.
+            label_5c = detect_label_from_path(csv, three_class_mode=False)
 
         # Derive a unique frame_dir relative to the csv_root. Prefer the
         # parent folder name (the sample folder inside skeleton_crop). If the
@@ -266,17 +321,41 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
         except Exception:
             # fallback
             frame_dir = csv.stem
-        ann = csv_to_annotation(csv, frame_dir=frame_dir, label=label,
+            
+        # csv_to_annotation은 5-class 레이블을 사용하여 어노테이션을 생성합니다.
+        ann = csv_to_annotation(csv, frame_dir=frame_dir, label=label_5c,
                                 img_shape=img_shape, normalize_method=normalize_method)
         if ann is None:
             print(f"[WARN] skipping empty or unreadable CSV: {csv}")
             continue
-        annotations.append(ann)
+        
+        # 5-class 레이블을 가진 어노테이션을 저장
+        annotations_5c.append(ann) 
         samples.append(frame_dir)
 
     # Diagnostic counts before normalization
-    parsed_ann_count = len(annotations)
+    parsed_ann_count = len(annotations_5c)
     print(f"Parsed annotations from CSVs: {parsed_ann_count}")
+
+    # --- 3-Class Label Transformation (Modified: 0, 1, 2) ---
+    # 5-class 레이블을 3-class 레이블 (0, 1, 2)로 변환합니다.
+    if three_class_mode:
+        print("[INFO] Applying 3-class label transformation: 0(worst,bad), 1(normal), 2(good,best)")
+        
+        def map_to_3c_012(label_5c):
+            """5-class 레이블 (0~4)을 3-class 레이블 (0~2)로 변환합니다."""
+            if label_5c in (0, 1):    # worst(0), bad(1) -> 0
+                return 0
+            elif label_5c == 2:      # normal(2) -> 1
+                return 1
+            elif label_5c in (3, 4):  # good(3), best(4) -> 2
+                return 2
+            return 1 # 기본값 (안전 장치: normal)
+            
+        for ann in annotations_5c:
+            ann['label'] = map_to_3c_012(ann['label'])
+    
+    annotations = annotations_5c # 이후 처리는 변환된 (또는 변환되지 않은) 리스트를 사용
 
     # Normalize/validate collected annotations: ensure 'keypoint' is a numpy
     # ndarray of dtype float32 and shape (M, T, V, 2) where M is number of
@@ -355,18 +434,16 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
 
     # optional train/val split
     random.seed(seed)
-    indices = list(range(len(annotations)))
     if test_mode:
         # In test mode, follow makePkl_forFintuning convention: put all samples
         # into the validation split only (xsub_val).
         split = {'xsub_val': [a['frame_dir'] for a in annotations]}
     else:
         if val_ratio > 0.0:
-            random.shuffle(indices)
-            k = int(len(indices) * val_ratio)
-            val_idx = set(indices[:k])
-            train_dirs = [annotations[i]['frame_dir'] for i in indices if i not in val_idx]
-            val_dirs = [annotations[i]['frame_dir'] for i in indices if i in val_idx]
+            # Perform stratified split to preserve class ratios in val set
+            train_idx, val_idx = stratified_split_annotations(annotations, val_ratio, seed=seed)
+            train_dirs = [annotations[i]['frame_dir'] for i in train_idx]
+            val_dirs = [annotations[i]['frame_dir'] for i in val_idx]
             split = {'xsub_train': train_dirs, 'xsub_val': val_dirs}
         else:
             split = {'xsub_train': [a['frame_dir'] for a in annotations]}
@@ -393,12 +470,14 @@ def cli():
     parser.add_argument('--val-ratio', type=float, default=0.0, help='holdout ratio for xsub_val')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--test', action='store_true', help='Write test PKL: place all samples into xsub_val only')
+    # three_class 플래그는 여전히 존재하며, 이제 실제로 레이블을 0, 1, 2로 변환합니다.
+    parser.add_argument('--three_class', action='store_true', help='Use 3-class labels: 0(worst,bad), 1(normal), 2(good,best)')
     args = parser.parse_args()
 
     h, w = [int(x) for x in args.img_shape.split(',')]
     collect_and_make(Path(args.csv_root), Path(args.out), img_shape=(h, w),
                      normalize_method=args.normalize, val_ratio=args.val_ratio, seed=args.seed,
-                     test_mode=bool(args.test))
+                     test_mode=bool(args.test), three_class_mode=bool(args.__dict__.get('three_class', False)))
 
 
 if __name__ == '__main__':

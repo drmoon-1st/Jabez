@@ -39,8 +39,8 @@ DEFAULT_PAD_RATIO = 0.1
 DEFAULT_PAD_X = DEFAULT_PAD_Y = DEFAULT_PAD_RATIO
 
 # Minimum crop dimensions (pixels). Clusters producing smaller crops will be skipped by default.
-DEFAULT_MIN_WIDTH = 160
-DEFAULT_MIN_HEIGHT = 160
+DEFAULT_MIN_WIDTH = 80
+DEFAULT_MIN_HEIGHT = 80
 
 
 

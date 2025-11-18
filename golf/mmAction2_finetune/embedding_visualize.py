@@ -32,8 +32,18 @@ CLASS_NAME_MAP = {
     4: 'best'
 }
 
+# 3-class name map (mapping will produce labels 0,2,3):
+CLASS_NAME_MAP_3 = {
+    0: 'bad',
+    1: 'normal',
+    2: 'good'
+}
+
 # When enabled, map model 5-class labels to binary for comparison/visualization
 TEST_BINARY = False
+
+# When enabled, map model 5-class labels to 3 classes for comparison/visualization
+THREE_CLASS = False
 
 def label_name(x):
     try:
@@ -42,6 +52,8 @@ def label_name(x):
         return str(x)
     if TEST_BINARY:
         return {0: 'false', 1: 'true'}.get(xi, str(xi))
+    if THREE_CLASS:
+        return CLASS_NAME_MAP_3.get(xi, str(xi))
     return CLASS_NAME_MAP.get(xi, str(xi))
 
 
@@ -68,6 +80,7 @@ def parse_args():
     p.add_argument('--umap-n-neighbors', type=int, default=15)
     p.add_argument('--umap-min-dist', type=float, default=0.1)
     p.add_argument('--test-binary', action='store_true', help='If set, map 5class outputs to binary (0/1) for comparison: (0,1)->0, (2,3,4)->1')
+    p.add_argument('--three_class', action='store_true', help='If set, map 5class outputs to 3 classes (0:bad,1:normal,2:good)')
     return p.parse_args()
 
 
@@ -382,7 +395,9 @@ def make_interactive(X2, labels, ids, out_html: Path, title: str, ref_X=None, re
 def main():
     args = parse_args()
     global TEST_BINARY
+    global THREE_CLASS
     TEST_BINARY = bool(args.test_binary)
+    THREE_CLASS = bool(args.three_class)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -515,6 +530,14 @@ def main():
                 ref_lbl = ref_lbl.reshape(-1).astype(np.int64)
             else:
                 ref_lbl = np.array([0 if int(x) in (0, 1) else 1 for x in ref_lbl.reshape(-1)], dtype=np.int64)
+
+    # If THREE_CLASS is requested, assume the PKL and model already use contiguous 3-class labels (0..2)
+    # and do not perform any remapping. `label_name` will use CLASS_NAME_MAP_3 when THREE_CLASS is True.
+    if THREE_CLASS:
+        # ensure labels shape/dtype
+        labels = labels.reshape(-1, 1).astype(np.int64)
+        if ref_lbl is not None:
+            ref_lbl = ref_lbl.reshape(-1).astype(np.int64)
 
     # If we have a reference and scaler, produce combined PCA (fit on ref) and combined t-SNE/UMAP
     if ref_emb is not None and args.method == 'pca':

@@ -17,7 +17,7 @@ on PATH or installed where you can provide the executable names.
 
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import sqlite3
 import json
 import subprocess
@@ -25,6 +25,7 @@ import threading
 import math
 import os
 import sys
+import re
 
 try:
     import cv2
@@ -217,11 +218,29 @@ class VideoSplitterGUI:
         btn_row.pack(fill='x')
         ttk.Button(btn_row, text='Add Marker at Current', command=self.add_marker_current).pack(side='left')
         ttk.Button(btn_row, text='Remove Nearest Marker', command=self.remove_nearest_marker).pack(side='left')
+        ttk.Button(btn_row, text='Auto Markers', command=self.auto_markers).pack(side='left')
+        ttk.Button(btn_row, text='Reset Markers', command=self.reset_markers).pack(side='left')
         ttk.Button(btn_row, text='Save Markers', command=self.save_markers).pack(side='left')
+        ttk.Button(btn_row, text='Delete Video', command=self.delete_current_file).pack(side='right', padx=(6,0))
         ttk.Button(btn_row, text='Split (apply)', command=self.split_current_file).pack(side='right')
 
         self.status = ttk.Label(master, text='Ready')
         self.status.pack(fill='x', padx=6, pady=4)
+
+        # keyboard bindings: left/right arrows move by 1 frame (also support up/down)
+        master.bind('<Left>', self.on_key_left)
+        master.bind('<Right>', self.on_key_right)
+        master.bind('<Up>', self.on_key_right)
+        master.bind('<Down>', self.on_key_left)
+        # ensure the main window has focus to receive key events
+        try:
+            master.focus_set()
+        except Exception:
+            pass
+
+        # loading/dialog window reference for long-running operations
+        self._loading_win = None
+        self._loading_bar = None
 
     def select_folder(self):
         d = filedialog.askdirectory()
@@ -229,12 +248,70 @@ class VideoSplitterGUI:
             self.root_dir = Path(d)
             self.status.config(text=f'Selected: {d}')
 
+    def _show_loading(self, text='Working...'):
+        """Show a small loading dialog with indeterminate progress."""
+        try:
+            if getattr(self, '_loading_win', None) is not None:
+                return
+            win = tk.Toplevel(self.master)
+            win.title('Please wait')
+            win.transient(self.master)
+            win.resizable(False, False)
+            # center over parent
+            try:
+                self.master.update_idletasks()
+                w = 300
+                h = 80
+                px = self.master.winfo_rootx()
+                py = self.master.winfo_rooty()
+                pw = self.master.winfo_width()
+                ph = self.master.winfo_height()
+                x = px + max(0, (pw - w) // 2)
+                y = py + max(0, (ph - h) // 2)
+                win.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
+            frm = ttk.Frame(win, padding=8)
+            frm.pack(fill='both', expand=True)
+            lbl = ttk.Label(frm, text=text)
+            lbl.pack(anchor='center')
+            bar = ttk.Progressbar(frm, mode='indeterminate')
+            bar.pack(fill='x', pady=(8,0))
+            try:
+                bar.start(10)
+            except Exception:
+                pass
+            # keep references
+            self._loading_win = win
+            self._loading_bar = bar
+        except Exception:
+            pass
+
+    def _hide_loading(self):
+        try:
+            if getattr(self, '_loading_bar', None) is not None:
+                try:
+                    self._loading_bar.stop()
+                except Exception:
+                    pass
+            if getattr(self, '_loading_win', None) is not None:
+                try:
+                    self._loading_win.destroy()
+                except Exception:
+                    pass
+            self._loading_win = None
+            self._loading_bar = None
+        except Exception:
+            pass
+
     def scan_folder(self):
         if not self.root_dir:
             messagebox.showwarning('Select folder', 'Choose a root folder first')
             return
-        self.files = list(self.root_dir.rglob('*.mp4'))
-        self.files = [p for p in self.files if p.is_file()]
+        # collect mp4 files but skip ones that look like already-split parts
+        all_mp4 = list(self.root_dir.rglob('*.mp4'))
+        # skip filenames like foo_part01.mp4, foo_part1.mp4, etc.
+        self.files = [p for p in all_mp4 if p.is_file() and not re.search(r'_part\d+\.mp4$', p.name, re.IGNORECASE)]
         self.listbox.delete(0, tk.END)
         for p in self.files:
             self.listbox.insert(tk.END, str(p.relative_to(self.root_dir)))
@@ -305,6 +382,20 @@ class VideoSplitterGUI:
         self.draw_markers()
         self.status.config(text=f'Loaded: {p.name} ({self.total_frames} frames, {self.fps:.2f} fps)')
 
+        # If there are no markers (not stored in DB), run auto_markers
+        # automatically from the start with a sensible default threshold.
+        # Run in background to avoid blocking the UI.
+        if not self.markers:
+            try:
+                # default threshold; user can change via UI if desired
+                threading.Thread(target=lambda: self.auto_markers(threshold=20.0, run_in_bg=True)).start()
+            except Exception:
+                # fallback: call synchronously
+                try:
+                    self.auto_markers(threshold=20.0, run_in_bg=False)
+                except Exception:
+                    pass
+
     def on_slider(self, val):
         if not self.cap:
             return
@@ -328,6 +419,28 @@ class VideoSplitterGUI:
             self.video_label.config(image=self.photo)
         except Exception as e:
             print('frame update error', e)
+
+    # keyboard handlers to step frames
+    def on_key_left(self, event=None):
+        self._step_frame(-1)
+
+    def on_key_right(self, event=None):
+        self._step_frame(1)
+
+    def _step_frame(self, delta: int):
+        """Move current position by delta frames (delta can be +/-1)."""
+        if not self.cap or self.current_index is None or self.total_frames <= 1:
+            return
+        try:
+            idx = int(self.slider.get())
+        except Exception:
+            idx = 0
+        new_idx = max(0, min(self.total_frames - 1, idx + delta))
+        if new_idx == idx:
+            return
+        # update slider and displayed frame
+        self.slider.set(new_idx)
+        self.update_frame(new_idx)
 
     def draw_markers(self):
         self.canvas.delete('all')
@@ -375,6 +488,104 @@ class VideoSplitterGUI:
             self.markers.remove(nearest)
             self.draw_markers()
 
+    def reset_markers(self):
+        """Clear all markers for the currently loaded file (not saved to DB until you press Save Markers)."""
+        if self.current_index is None:
+            return
+        p = self.files[self.current_index]
+        answer = messagebox.askyesno('Reset markers', f'Clear all markers for: {p.name}?\nThis will NOT be saved to the database until you press "Save Markers".')
+        if not answer:
+            return
+        self.markers = []
+        self.draw_markers()
+        self.status.config(text=f'Markers cleared for {p.name} (unsaved)')
+
+    def auto_markers(self, threshold: float = None, run_in_bg: bool = True):
+        """Scan the current file and add markers where frame-to-frame
+        mean grayscale difference >= threshold.
+
+        - If `threshold` is None, prompt the user with a dialog.
+        - If `run_in_bg` is True, scanning runs in a worker thread and UI
+          updates are scheduled on the main thread.
+        """
+        if self.current_index is None or not self.cap_path:
+            # only inform on main thread
+            self.master.after(0, lambda: messagebox.showwarning('No file', 'Load a file first'))
+            return
+
+        def start_scan(th_val: float):
+            cap2 = cv2.VideoCapture(str(self.cap_path))
+            prev_gray = None
+            markers_found = []
+            idx = 0
+            total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            try:
+                while True:
+                    ret, frame = cap2.read()
+                    if not ret:
+                        break
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if prev_gray is not None:
+                        diff = cv2.absdiff(prev_gray, gray)
+                        mean_diff = float(diff.mean())
+                        if mean_diff >= float(th_val):
+                            # mark the current frame (the first frame of the new
+                            # swing/event). `idx` already refers to the frame we
+                            # just read, so use `idx` (clamped) to avoid off-by-one.
+                            shifted = min(idx, max(0, total - 1))
+                            markers_found.append(shifted)
+                    prev_gray = gray
+                    idx += 1
+                    # progress update (schedule on main thread)
+                    if idx % 200 == 0:
+                        self.master.after(0, lambda i=idx, t=total: self.status.config(text=f'Auto-marking... {i}/{t} frames'))
+                return markers_found
+            finally:
+                try:
+                    cap2.release()
+                except Exception:
+                    pass
+
+        def apply_markers(markers_found):
+            # merge with existing markers and redraw on main thread
+            self.markers = sorted(set(self.markers + markers_found))
+            self.draw_markers()
+            self.status.config(text=f'Auto markers added: {len(markers_found)}')
+
+        # determine threshold (on main thread if prompting)
+        if threshold is None:
+            th = simpledialog.askfloat('Auto markers', 'Frame diff threshold (0-255):', initialvalue=20.0, minvalue=0.0, maxvalue=255.0)
+            if th is None:
+                return
+        else:
+            th = float(threshold)
+
+        # run scan in background thread and apply results on main thread
+        def worker():
+            # show loading dialog and set initial status
+            self.master.after(0, lambda: [self._show_loading('Auto-marking (scanning frames)...'), self.status.config(text='Auto-marking (scanning frames)...')])
+            markers_found = start_scan(th)
+            # hide loading dialog and apply markers on main thread
+            self.master.after(0, lambda m=markers_found: (self._hide_loading(), apply_markers(m)))
+
+        if run_in_bg:
+            t = threading.Thread(target=worker)
+            t.start()
+        else:
+            # run synchronously (useful as fallback)
+            try:
+                self._show_loading('Auto-marking (scanning frames)...')
+                self.master.update()
+            except Exception:
+                pass
+            self.status.config(text='Auto-marking (scanning frames)...')
+            markers_found = start_scan(th)
+            try:
+                self._hide_loading()
+            except Exception:
+                pass
+            apply_markers(markers_found)
+
     def save_markers(self):
         if self.current_index is None:
             return
@@ -410,16 +621,86 @@ class VideoSplitterGUI:
         t = threading.Thread(target=self._do_split, args=(p,))
         t.start()
 
+    def delete_current_file(self):
+        if self.current_index is None:
+            return
+        p = self.files[self.current_index]
+        answer = messagebox.askyesno('Confirm delete', f'Are you sure you want to delete (no split): {p.name}?')
+        if not answer:
+            return
+        t = threading.Thread(target=self._do_delete, args=(p,))
+        t.start()
+
+    def _do_delete(self, path: Path):
+        # mark deleted in DB then remove file and update UI on main thread
+        try:
+            self.db.set_status(str(path), 'deleted')
+        except Exception:
+            pass
+        # release capture if open for this path
+        try:
+            if getattr(self, 'cap', None) is not None and getattr(self, 'cap_path', None) == path:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                self.cap_path = None
+        except Exception:
+            pass
+        # try to delete the file
+        try:
+            os.remove(path)
+        except Exception as e:
+            try:
+                self.db.set_status(str(path), 'error')
+            except Exception:
+                pass
+            self.master.after(50, lambda: messagebox.showerror('Delete failed', f'Could not remove file:\n{path}\n{e}'))
+            self.master.after(50, lambda: self.status.config(text=f'Delete failed: {e}'))
+            return
+
+        # update UI on main thread
+        def ui_update():
+            try:
+                idx = self.current_index
+                if idx is not None and 0 <= idx < len(self.files) and self.files[idx] == path:
+                    self.listbox.delete(idx)
+                    self.files.pop(idx)
+                    if idx < len(self.files):
+                        self.load_file(idx)
+                        self.listbox.selection_clear(0, tk.END)
+                        self.listbox.selection_set(idx)
+                    elif idx-1 >= 0:
+                        self.load_file(idx-1)
+                        self.listbox.selection_clear(0, tk.END)
+                        self.listbox.selection_set(idx-1)
+                    else:
+                        self.current_index = None
+                        self.video_label.config(image='')
+                        self.slider.set(0)
+                        self.markers = []
+                        self.draw_markers()
+                self.status.config(text=f'Deleted: {path.name}')
+            except Exception as e:
+                self.status.config(text=f'Delete UI update failed: {e}')
+
+        self.master.after(50, ui_update)
+
     def _do_split(self, path: Path):
         self.db.set_status(str(path), 'in_progress')
         # build segments from markers
         markers_sorted = sorted(set(self.markers))
-        frames = [0] + markers_sorted + [max(0, self.total_frames-1)]
+        # use frame boundaries as half-open intervals [a, b) where b is
+        # the first frame of the next segment. Use self.total_frames as the
+        # final boundary so the last segment includes the last frame.
+        frames = [0] + markers_sorted + [self.total_frames]
         segments = []
         for a, b in zip(frames[:-1], frames[1:]):
+            # include frames a..(b-1). Require at least one frame.
             if b - a >= 1:
                 s = a / self.fps
-                e = (b+1) / self.fps
+                e = b / self.fps
                 if e > s:
                     segments.append((s, min(e, self.duration)))
 

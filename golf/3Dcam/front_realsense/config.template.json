@@ -5,5 +5,3 @@
   "SCOPE": "openid profile",
   "BACKEND_BASE": "http://localhost:29001"
 }
-
-# 복사하여 config.json으로 저장하고 값들을 채워 사용하세요.

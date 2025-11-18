@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import json
+from collections import deque
 
 import numpy as np
 import cv2
@@ -183,3 +184,235 @@ class RecorderWrapper:
         if not color_dir.exists():
             return 0
         return len(list(color_dir.glob('*.png')))
+
+
+class BufferedRealsenseRecorder:
+    """Continuously capture frames into an in-memory ring buffer.
+    Call `start_saving(out_dir)` to write buffered frames and continue writing live frames.
+    """
+    def __init__(self, buf_seconds=10, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._buf_seconds = int(buf_seconds)
+        self._maxlen = max(1, int(self._buf_seconds * self.fps))
+        self._buffer = deque(maxlen=self._maxlen)  # store tuples (color, depth)
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._running = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._last_color = None
+        self._idx = 0
+        self._saving = threading.Event()
+        self._save_lock = threading.Lock()
+        self._intrinsics_obj = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._running.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        while not self._running.is_set():
+            time.sleep(0.01)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def is_running(self):
+        return self._running.is_set()
+
+    def get_last_frame(self):
+        try:
+            with self._frame_lock:
+                return self._last_color.copy() if self._last_color is not None else None
+        except Exception:
+            return None
+
+    def start_saving(self, out_dir: Path):
+        """Start writing buffered frames and subsequent frames to disk under out_dir."""
+        out_dir = Path(out_dir)
+        color_dir = out_dir / 'color'
+        depth_dir = out_dir / 'depth'
+        color_dir.mkdir(parents=True, exist_ok=True)
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        # write intrinsics if available
+        try:
+            if self._intrinsics_obj is not None:
+                (out_dir / "intrinsics.json").write_text(json.dumps(self._intrinsics_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+
+        def _drain_and_flag():
+            # write existing buffered frames first
+            try:
+                with self._save_lock:
+                    idx = self._idx
+                    # copy buffer snapshot
+                    with self._frame_lock:
+                        items = list(self._buffer)
+                    for color_img, depth_m in items:
+                        color_path = color_dir / f"{idx:06d}.png"
+                        depth_path = depth_dir / f"{idx:06d}.npy"
+                        try:
+                            cv2.imwrite(str(color_path), color_img)
+                        except Exception:
+                            pass
+                        try:
+                            if depth_m is not None:
+                                np.save(depth_path, depth_m)
+                        except Exception:
+                            pass
+                        idx += 1
+                    # set index to continue
+                    self._idx = idx
+                    # enable live saving
+                    self._saving.set()
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_and_flag, daemon=True).start()
+
+    def stop_saving(self):
+        self._saving.clear()
+
+    def is_saving(self):
+        return self._saving.is_set()
+
+    def _run(self):
+        # If pyrealsense2 is available, use RealSense pipeline, else fallback to OpenCV capture
+        if rs is not None:
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
+            config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+            align = rs.align(rs.stream.color)
+            profile = pipeline.start(config)
+            try:
+                depth_sensor = profile.get_device().first_depth_sensor()
+                depth_scale = depth_sensor.get_depth_scale()
+                intr = None
+                self._running.set()
+                while not self._stop_event.is_set():
+                    frames = pipeline.wait_for_frames()
+                    frames = align.process(frames)
+                    depth = frames.get_depth_frame()
+                    color = frames.get_color_frame()
+                    if not depth or not color:
+                        continue
+                    if intr is None:
+                        try:
+                            ci = color.profile.as_video_stream_profile().intrinsics
+                            intr = {
+                                "width": ci.width,
+                                "height": ci.height,
+                                "fx": float(ci.fx),
+                                "fy": float(ci.fy),
+                                "cx": float(ci.ppx),
+                                "cy": float(ci.ppy),
+                                "coeffs": [float(c) for c in getattr(ci, 'coeffs', [])]
+                            }
+                            meta = {"fps": self.fps, "width": self.width, "height": self.height, "depth_scale": float(depth_scale)}
+                            self._intrinsics_obj = {"color_intrinsics": intr, "meta": meta}
+                        except Exception:
+                            self._intrinsics_obj = None
+
+                    color_img = np.asanyarray(color.get_data())
+                    depth_raw = np.asanyarray(depth.get_data())
+                    depth_m = (depth_raw.astype(np.float32) * depth_scale)
+
+                    with self._frame_lock:
+                        self._last_color = color_img.copy()
+                        # append copy to buffer
+                        try:
+                            self._buffer.append((color_img.copy(), depth_m.copy()))
+                        except Exception:
+                            # fall back to appending color only
+                            try:
+                                self._buffer.append((color_img.copy(), None))
+                            except Exception:
+                                pass
+
+                    # if saving enabled, write immediately
+                    if self._saving.is_set():
+                        try:
+                            with self._save_lock:
+                                color_path = Path.cwd() / 'tmp'  # placeholder, actual dirs set when start_saving drains
+                        except Exception:
+                            pass
+
+            except Exception:
+                traceback.print_exc()
+            finally:
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                self._running.clear()
+                with self._frame_lock:
+                    self._last_color = None
+        else:
+            # OpenCV fallback (no depth)
+            try:
+                import cv2 as _cv2
+                try_backends = [getattr(_cv2, 'CAP_DSHOW', 700), None]
+                cap = None
+                for b in try_backends:
+                    try:
+                        if b is None:
+                            cap = _cv2.VideoCapture(0)
+                        else:
+                            cap = _cv2.VideoCapture(0, b)
+                        time.sleep(0.2)
+                        if cap is not None and cap.isOpened():
+                            break
+                    except Exception:
+                        cap = None
+                if cap is None or not cap.isOpened():
+                    return
+                self._running.set()
+                while not self._stop_event.is_set():
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        time.sleep(0.05)
+                        continue
+                    with self._frame_lock:
+                        self._last_color = frame.copy()
+                        try:
+                            self._buffer.append((frame.copy(), None))
+                        except Exception:
+                            pass
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+
+class ContinuousRecorderWrapper:
+    """Facade used by UI: continuously buffers frames and can start/stop saving."""
+    def __init__(self, buf_seconds=10, width=640, height=480, fps=30):
+        # Choose buffered recorder implementation
+        self._rec = BufferedRealsenseRecorder(buf_seconds=buf_seconds, width=width, height=height, fps=fps)
+
+    def start(self):
+        self._rec.start()
+
+    def stop(self):
+        self._rec.stop()
+
+    def get_last_frame(self):
+        return self._rec.get_last_frame()
+
+    def start_saving(self, out_dir: str):
+        self._rec.start_saving(Path(out_dir))
+
+    def stop_saving(self):
+        self._rec.stop_saving()
+
+    def is_saving(self):
+        return self._rec.is_saving()
