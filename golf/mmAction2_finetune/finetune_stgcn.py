@@ -35,6 +35,10 @@ DEFAULT_CFG = r"configs\skeleton\stgcnpp\my_stgcnpp.py"
 THREE_CLASS_INPUT_PKL = r"D:\golfDataset\crop_pkl\combined_3class.pkl"
 THREE_CLASS_CFG = r"configs\skeleton\stgcnpp\my_stgcnpp_3class.py"
 
+# Fixed paths for WBN (Worst/Bad/Normal -> classes 0,1,2)
+WBN_INPUT_PKL = r"D:\golfDataset\crop_pkl\combined_WBNclass.pkl"
+WBN_CFG = r"configs\skeleton\stgcnpp\my_stgcnpp_WBN.py"
+
 DEFAULT_PRETRAINED = r"D:\mmaction2\checkpoints\stgcnpp_8xb16-bone-u100-80e_ntu60-xsub-keypoint-2d_20221228-cd11a691.pth"
 DEFAULT_WORK_DIR = r"D:\work_dirs\finetune_stgcn_shuffle"
 
@@ -128,6 +132,9 @@ def main():
     # ⭐️ [추가] 3-class 모드 옵션 추가
     parser.add_argument('--three_class', action='store_true',
                         help='3-class 모드를 사용하고 해당 설정/PKL 경로를 로드합니다. (num_classes=3)')
+    # WBN: evaluate/train only classes 0,1,2 (Worst/Bad/Normal)
+    parser.add_argument('--WBN', action='store_true',
+                        help='WBN 모드를 사용합니다: 클래스 0,1,2(3-way)만 학습/평가합니다.')
     # resume training from last checkpoint in work_dir
     parser.add_argument('--continue', dest='resume', action='store_true',
                         help='Resume training from last checkpoint found in work_dir (reads last_checkpoint file).')
@@ -137,11 +144,18 @@ def main():
     args = parser.parse_args()
 
     # ⭐️ [수정] 클래스 모드에 따른 기본값 설정 (스크립트 초기에 경로 결정)
-    if args.three_class:
+    # Priority: explicit --WBN > --three_class > default 5-class
+    if args.WBN:
+        args.input_pkl = WBN_INPUT_PKL
+        args.cfg = WBN_CFG
+        n_classes_override = 3
+        print('[MODE] WBN mode enabled: using 3-class (0,1,2) PKL and config')
+    elif args.three_class:
         args.input_pkl = THREE_CLASS_INPUT_PKL
         args.cfg = THREE_CLASS_CFG
         # 3-class 모드일 경우 n_classes를 3으로 하드코딩 (나중에 추론 로직에서 오버라이드 가능)
         n_classes_override = 3
+        print('[MODE] three_class mode enabled: using 3-class PKL and config')
     else:
         args.input_pkl = DEFAULT_INPUT_PKL
         args.cfg = DEFAULT_CFG

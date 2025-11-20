@@ -52,3 +52,5 @@ golf/containers/openpose-api/pose_iter_440000.caffemodel
 
 golf/3Dcam/realsense_pack_and_upload/dist/
 golf/3Dcam/realsense_pack_and_upload/realsense_pack_and_upload.config.json
+
+golf/3Dcam/front_realsense/record

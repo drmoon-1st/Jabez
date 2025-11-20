@@ -74,11 +74,10 @@ def extract_pred_idx(item):
 
 def map_to_three(pred_idx):
     """
-    Map original 5-class index to 3 classes: 0,1,2.
-    Default mapping (assumed):
-      0 -> 0
-      1 -> 1
-      2,3,4 -> 2
+    Map original 5-class index to 3 classes using the requested mapping:
+      0,1 -> 0
+      2   -> 1
+      3,4 -> 2
     Returns None if input is None or invalid.
     """
     if pred_idx is None:
@@ -87,13 +86,12 @@ def map_to_three(pred_idx):
         v = int(pred_idx)
     except Exception:
         return None
-    # mapping requested: 0,1 -> 0 ; 2 -> 2 ; 3,4 -> 3
     if v in (0, 1):
         return 0
     if v == 2:
-        return 2
+        return 1
     if v in (3, 4):
-        return 3
+        return 2
     return None
 
 
@@ -199,10 +197,19 @@ def main():
     parser.add_argument('--split', default='xsub_val', help='split name inside PKL to evaluate')
     parser.add_argument('--out-csv', default='finetune_test_results.csv', help='Per-sample results CSV')
     parser.add_argument('--three_class', action='store_true', help='Evaluate using 3-class mapping (0,1,2). Overrides config to _3class if set.')
+    parser.add_argument('--WBN', action='store_true', help='Evaluate WBN mode (classes 0,1,2 only). Sets three_class and uses WBN config/test PKL by default.')
     args = parser.parse_args()
 
     # If requested, override config to the 3-class variant
-    if args.three_class:
+    # WBN mode: prefer WBN config and treat as 3-class labels
+    if args.WBN:
+        args.config = os.path.join(MM_ROOT, 'configs', 'skeleton', 'stgcnpp', 'my_stgcnpp_WBN.py')
+        args.three_class = True
+        # if user didn't override test-pkl, use a WBN-specific test PKL path
+        if args.test_pkl == r"D:\golfDataset\crop_pkl\skeleton_dataset_test.pkl":
+            args.test_pkl = r"D:\golfDataset\crop_pkl\combined_WBNclass_test.pkl"
+        print('[MODE] WBN mode enabled for test: treating data as 3-class (0,1,2)')
+    elif args.three_class:
         args.config = os.path.join(MM_ROOT, 'configs', 'skeleton', 'stgcnpp', 'my_stgcnpp_3class.py')
 
     cfg = Config.fromfile(args.config)
@@ -496,14 +503,29 @@ def main():
         }
         print(json.dumps(fc_out, indent=2))
 
+        # Also compute mapped 3-class metrics using mapping: 0,1->0 ; 2->1 ; 3,4->2
+        gt_mapped_3 = [map_to_three(v) for v in gt_raw]
+        pred_mapped_3 = [map_to_three(p) for p in pred_idx_list]
+        three_from_five_summary = compute_multiclass_metrics(gt_mapped_3, pred_mapped_3, num_classes=3)
+        print('\nMapped Three-class Evaluation (from 5-class results) Summary:')
+        tf_out = {
+            'valid_predictions_count': three_from_five_summary.get('valid'),
+            'accuracy': three_from_five_summary.get('accuracy'),
+            'per_class': three_from_five_summary.get('per_class')
+        }
+        print(json.dumps(tf_out, indent=2))
+
+        # Write CSV with both 5-class and mapped 3-class columns
         with open(out_csv, 'w', newline='', encoding='utf-8') as csvf:
             writer = csv.writer(csvf)
-            writer.writerow(['id', 'gt_label_5', 'pred_class_5'])
-            for idv, g5, p5 in zip(ids, gt_raw, pred_idx_list):
+            writer.writerow(['id', 'gt_label_5', 'pred_class_5', 'gt_label_3_mapped', 'pred_class_3_mapped'])
+            for idv, g5, p5, g3, p3 in zip(ids, gt_raw, pred_idx_list, gt_mapped_3, pred_mapped_3):
                 writer.writerow([
                     idv,
                     g5 if g5 is not None else '',
-                    p5 if p5 is not None else ''
+                    p5 if p5 is not None else '',
+                    g3 if g3 is not None else '',
+                    p3 if p3 is not None else ''
                 ])
 
     print(f"Per-sample results written to: {out_csv}")

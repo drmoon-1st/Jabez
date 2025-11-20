@@ -39,6 +39,13 @@ CLASS_NAME_MAP_3 = {
     2: 'good'
 }
 
+# WBN 3-class mapping (worst, bad, normal)
+CLASS_NAME_MAP_WBN = {
+    0: 'worst',
+    1: 'bad',
+    2: 'normal'
+}
+
 # When enabled, map model 5-class labels to binary for comparison/visualization
 TEST_BINARY = False
 
@@ -81,6 +88,7 @@ def parse_args():
     p.add_argument('--umap-min-dist', type=float, default=0.1)
     p.add_argument('--test-binary', action='store_true', help='If set, map 5class outputs to binary (0/1) for comparison: (0,1)->0, (2,3,4)->1')
     p.add_argument('--three_class', action='store_true', help='If set, map 5class outputs to 3 classes (0:bad,1:normal,2:good)')
+    p.add_argument('--WBN', action='store_true', help='If set, treat test PKL as WBN classes (0:worst,1:bad,2:normal). Filters out labels 3/4 and sets three_class mode.')
     return p.parse_args()
 
 
@@ -398,12 +406,36 @@ def main():
     global THREE_CLASS
     TEST_BINARY = bool(args.test_binary)
     THREE_CLASS = bool(args.three_class)
+    # If WBN requested, enable three_class and override 3-class name mapping
+    if getattr(args, 'WBN', False):
+        THREE_CLASS = True
+        # override CLASS_NAME_MAP_3 for WBN semantics
+        try:
+            globals()['CLASS_NAME_MAP_3'] = CLASS_NAME_MAP_WBN
+            print('[MODE] WBN mode enabled: using 3-class labels (0:worst,1:bad,2:normal)')
+        except Exception:
+            pass
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print('Running test & capturing embeddings...')
     embs, labels, ids = run_and_capture(args.config, args.checkpoint, args.test_pkl, args.split, args.mm_root, args.device, args.num_workers)
     print(f'Captured embeddings: {embs.shape}, labels: {labels.shape}, ids: {ids.shape}')
+
+    # If WBN mode, filter out any samples whose labels are not in {0,1,2}
+    if getattr(args, 'WBN', False):
+        lab_flat = labels.reshape(-1)
+        mask = np.isin(lab_flat, [0, 1, 2])
+        kept = int(mask.sum())
+        total = lab_flat.shape[0]
+        if kept != total:
+            print(f"[INFO] WBN filter: keeping {kept}/{total} samples with labels in {{0,1,2}}; dropped {total-kept} samples with labels 3/4")
+        if embs.ndim == 3:
+            embs = embs[mask]
+        else:
+            embs = embs[mask]
+        labels = labels.reshape(-1, 1)[mask].astype(np.int64)
+        ids = ids[mask]
 
     # support alias 'flatten' in aggregate
     if args.aggregate == 'flatten':

@@ -118,7 +118,7 @@ class App:
         # no in-app logo header: logo is used only as window icon per user request
         # show login as outline button to match example style (row 1)
         self.login_btn_container, self.login_btn = _make_button(frm, 'Login', self.do_login, style='outline')
-        self.login_btn_container.grid(row=1, column=0, pady=6)
+        self.login_btn_container.grid(row=0, column=0, sticky='nw', pady=6)
 
         # placeholder for logout (hidden until login)
         self.logout_btn = None
@@ -190,53 +190,48 @@ class App:
         # 로그인 성공 후에만 녹화/업로드 컨트롤을 보여줍니다.
         frm = self.root.winfo_children()[0]
         # Create nicely styled buttons that match the designer reference
-        def _make_button_local(parent, text, command, style='outline'):
-            # keep behavior consistent with builder helper above
-            container = tk.Frame(parent, bg='black')
-            if style == 'outline':
-                border = tk.Frame(container, bg=self.highlight_color, padx=2, pady=2)
-                border.pack()
-                btn_bg = 'black'
-                fg = self.highlight_color
-            else:
-                border = tk.Frame(container, bg='black', padx=0, pady=0)
-                border.pack()
-                btn_bg = self.highlight_color
-                fg = 'black'
-            btn = tk.Button(border, text=text, command=command, bg=btn_bg, fg=fg,
-                            activebackground=btn_bg, relief='flat', padx=14, pady=8)
-            btn.pack()
-            return container, btn
+        # Use the class-level _make_button helper for consistent rounded buttons
 
         # Group recording-related buttons into a single container so they can be shown/hidden together
         if not getattr(self, 'controls_container', None):
-            self.controls_container = tk.Frame(frm, bg='black')
-            # place container where Start Recording previously lived
-            self.controls_container.grid(row=2, column=0, columnspan=3, pady=6, sticky='w')
+            # create a stable bottom bar to hold controls and timer so they never overlap the preview
+            if not getattr(self, 'bottom_bar', None):
+                self.bottom_bar = tk.Frame(frm, bg=self.bg_color)
+                # put bottom_bar in its own grid row below the preview
+                try:
+                    self.bottom_bar.grid(row=8, column=0, columnspan=2, sticky='we', pady=12)
+                except Exception:
+                    try:
+                        self.bottom_bar.pack(side='bottom', fill='x')
+                    except Exception:
+                        pass
+            # controls container sits inside bottom_bar on the left
+            self.controls_container = tk.Frame(self.bottom_bar, bg=self.bg_color, bd=0, highlightbackground='#6e6e6e', highlightthickness=1, padx=8, pady=6)
+            self.controls_container.pack(side='left', padx=8, pady=6)
 
         if not self.btn_start:
-            c, b = _make_button_local(self.controls_container, 'Start Recording', self.start_recording, style='outline')
-            c.grid(row=0, column=0, pady=6)
+            c, b = self._make_button(self.controls_container, 'Start Recording', self.start_recording, style='outline')
+            c.pack(side='left', padx=(0,8), pady=6)
             self.btn_start = b
             self.btn_start_container = c
         if not hasattr(self, 'btn_rerecord') or not self.btn_rerecord:
             # place Re-record to the right of Start Recording
             try:
-                c2, b2 = _make_button_local(self.controls_container, 'Re-record', self.re_recording, style='outline')
-                c2.grid(row=0, column=1, padx=(8,0))
+                c2, b2 = self._make_button(self.controls_container, 'Re-record', self.re_recording, style='outline')
+                c2.pack(side='left', padx=(8,0), pady=6)
                 self.btn_rerecord = b2
                 self.btn_rerecord_container = c2
             except Exception:
                 self.btn_rerecord = None
                 self.btn_rerecord_container = None
         if not self.btn_stop:
-            c, b = _make_button_local(self.controls_container, 'Stop Recording', self.stop_recording, style='outline')
-            c.grid(row=1, column=0, pady=6)
+            c, b = self._make_button(self.controls_container, 'Stop Recording', self.stop_recording, style='outline')
+            c.pack(side='left', padx=(8,0), pady=6)
             self.btn_stop = b
             self.btn_stop_container = c
         if not self.btn_package:
-            c, b = _make_button_local(self.controls_container, 'Package & Upload', self.package_and_upload, style='outline')
-            c.grid(row=2, column=0, pady=6)
+            c, b = self._make_button(self.controls_container, 'Package & Upload', self.package_and_upload, style='outline')
+            c.pack(side='left', padx=(8,0), pady=6)
             self.btn_package = b
             self.btn_package_container = c
 
@@ -256,7 +251,7 @@ class App:
         # add logout button and login-info label (top-right)
         if not self.logout_btn:
             c, b = self._make_button(frm, 'Logout', self.do_logout, style='outline')
-            c.grid(row=1, column=1, padx=(8,0))
+            c.grid(row=0, column=1, sticky='ne', padx=(8,0))
             self.logout_btn = b
             self.logout_btn_container = c
         # show compact login info to the right
@@ -303,7 +298,7 @@ class App:
                 except Exception:
                     pass
                 self.login_info_label = tk.Label(frm, text=login_text, bg=self.bg_color, fg=self.muted_text, font=('Arial', 9))
-                self.login_info_label.grid(row=1, column=2, sticky='e', padx=(8,0))
+                self.login_info_label.grid(row=0, column=2, sticky='ne', padx=(8,0))
         except Exception:
             pass
 
@@ -343,7 +338,15 @@ class App:
         if not hasattr(self, 'timer_display'):
             # card-like container to emulate the designer's panels
             card = tk.Frame(frm, bg=self.card_bg, bd=0, padx=18, pady=14)
-            card.grid(row=7, column=0, pady=(12,6), sticky='n')
+            # Place timer into the bottom_bar to the right of the controls so borders do not overlap.
+            try:
+                if getattr(self, 'bottom_bar', None):
+                    card.pack(in_=self.bottom_bar, side='right', padx=8, pady=6)
+                else:
+                    # fallback to grid if bottom_bar isn't available
+                    card.grid(row=7, column=0, pady=(12,6), sticky='n')
+            except Exception:
+                card.grid(row=7, column=0, pady=(12,6), sticky='n')
             self.timer_display = tk.Label(card, textvariable=self.timer_var, font=('Consolas', 20, 'bold'), bg=self.card_bg, fg=self.highlight_color)
             self.timer_display.pack(pady=(4,8))
             tfrm = tk.Frame(card, bg='#0b0b0b')
@@ -363,7 +366,17 @@ class App:
             black = Image.new('RGB', (preview_w, preview_h), color=(16,16,16))
             self.preview_image_ref = ImageTk.PhotoImage(black)
             self.preview_label = tk.Label(frm, image=self.preview_image_ref, bg=self.card_bg, width=preview_w, height=preview_h)
-            self.preview_label.grid(row=9, column=0, pady=6)
+            # place preview at the top-left of the app
+            self.preview_label.grid(row=0, column=0, sticky='nw', pady=6)
+
+        # reposition status and cam status into the right column (middle->bottom)
+        try:
+            self.status_label.grid_forget()
+            self.cam_status_label.grid_forget()
+            self.status_label.grid(row=3, column=2, sticky='ne', padx=12, pady=(60,0))
+            self.cam_status_label.grid(row=4, column=2, sticky='ne', padx=12, pady=(6,0))
+        except Exception:
+            pass
 
     def paste_token(self):
         # allow user to paste an access token or a JSON blob copied from the web callback
@@ -520,7 +533,7 @@ class App:
             out_base.mkdir(parents=True, exist_ok=True)
             out = out_base / f'record_{int(time.time())}'
             out.mkdir(parents=True, exist_ok=True)
-            # start saving buffered frames to disk
+            # start saving buffered frames to disk (or defer start if pre-countdown requested)
             try:
                 if not self.rec:
                     self.root.after(0, lambda: messagebox.showerror('Recorder error', 'No continuous recorder available'))
@@ -530,17 +543,71 @@ class App:
                     self.last_out_dir = out
                 except Exception:
                     self.last_out_dir = None
-                self.rec.start_saving(out)
-                self.root.after(0, lambda: self.set_status(f'Recording -> {out}'))
+                # if a pre-countdown was requested, don't start saving yet; store pending path
+                try:
+                    if getattr(self, '_precountdown_secs', None) and int(getattr(self, '_precountdown_secs', 0)) > 0:
+                        # store pending out dir so the UI timer can start saving at zero
+                        try:
+                            self._pending_out_dir = out
+                        except Exception:
+                            self._pending_out_dir = out
+                        # update status to reflect pending recording
+                        try:
+                            self.root.after(0, lambda: self.set_status(f'Pending recording -> {out}'))
+                        except Exception:
+                            pass
+                    else:
+                        # start saving only from now on; discard earlier buffered frames
+                        try:
+                            # if recorder supports drain flag, pass drain=False to discard previous buffer
+                            self.rec.start_saving(out, drain=False)
+                        except TypeError:
+                            # fallback for older recorder implementations
+                            self.rec.start_saving(out)
+                        self.root.after(0, lambda: self.set_status(f'Recording -> {out}'))
+                except Exception:
+                    # fallback to immediate start if anything goes wrong
+                    try:
+                        self.rec.start_saving(out)
+                        self.root.after(0, lambda: self.set_status(f'Recording -> {out}'))
+                    except Exception:
+                        pass
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror('Recorder start failed', str(e)))
 
-        threading.Thread(target=_rec_start, daemon=True).start()
-        # start UI timer (elapsed or countdown depending on control)
+        # check if user enabled countdown (pre-start delay)
+        pre_secs = None
         try:
-            self._start_timer()
+            if getattr(self, 'countdown_enabled', None) and self.countdown_enabled.get():
+                try:
+                    s = self.countdown_entry.get().strip()
+                    pre_secs = int(s) if s else None
+                except Exception:
+                    pre_secs = None
         except Exception:
-            pass
+            pre_secs = None
+
+        # start background thread to prepare output dir; thread will either start saving immediately
+        # or set pending out_dir so timer can kick off saving after pre-countdown.
+        threading.Thread(target=_rec_start, daemon=True).start()
+
+        if pre_secs and pre_secs > 0:
+            # set pre-countdown state; timer will show negative seconds until 0
+            self._precountdown_secs = int(pre_secs)
+            self._precountdown_active = True
+            # pending out dir will be set by background _rec_start; store placeholder
+            self._pending_out_dir = None
+            # start UI timer (for showing negative countdown)
+            try:
+                self._start_timer()
+            except Exception:
+                pass
+        else:
+            # no pre-countdown: start timer now (saving is started by background thread)
+            try:
+                self._start_timer()
+            except Exception:
+                pass
 
     def stop_recording(self):
         # Stop recorder in background to avoid blocking GUI
@@ -788,7 +855,61 @@ class App:
             return
         now = time.time()
         elapsed = int(now - (self._timer_start_ts or now))
-        if self._timer_countdown_secs is not None:
+        # If pre-countdown active, show negative countdown and start recording at zero
+        if getattr(self, '_precountdown_active', False):
+            prec = int(getattr(self, '_precountdown_secs', 0) or 0)
+            remaining = int(prec - elapsed)
+            if remaining > 0:
+                # display negative countdown like -HH:MM:SS
+                h = remaining // 3600
+                m = (remaining % 3600) // 60
+                s = remaining % 60
+                self.timer_var.set(f"-{h:02d}:{m:02d}:{s:02d}")
+                # schedule next tick
+                try:
+                    self.root.after(250, self._timer_tick)
+                except Exception:
+                    pass
+                return
+            else:
+                # reached zero: start actual recording now if pending out dir exists
+                self.timer_var.set('00:00:00')
+                # try to start saving using pending out dir set by background thread
+                try:
+                    out = getattr(self, '_pending_out_dir', None) or getattr(self, 'last_out_dir', None)
+                    if out and self.rec:
+                        try:
+                            # start saving and discard previous buffer
+                            try:
+                                self.rec.start_saving(out, drain=False)
+                            except TypeError:
+                                self.rec.start_saving(out)
+                            self.root.after(0, lambda: self.set_status(f'Recording -> {out}'))
+                        except Exception:
+                            # if starting saving failed, show status and continue
+                            self.root.after(0, lambda: self.set_status('Failed to start saving'))
+                    else:
+                        # pending out dir not ready yet; update status and wait a bit
+                        self.root.after(0, lambda: self.set_status('Waiting for recorder...'))
+                        # keep timer running so we will try again
+                        try:
+                            self.root.after(250, self._timer_tick)
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
+                # clear pre-countdown state and begin standard elapsed timer
+                try:
+                    self._precountdown_active = False
+                    self._pending_out_dir = None
+                except Exception:
+                    pass
+                # reset timer start to count up from zero
+                self._timer_start_ts = time.time()
+                self._timer_countdown_secs = None
+                secs = 0
+        elif self._timer_countdown_secs is not None:
             remaining = int(self._timer_countdown_secs - elapsed)
             if remaining <= 0:
                 # reached zero -> stop recording

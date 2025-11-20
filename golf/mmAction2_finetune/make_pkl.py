@@ -36,7 +36,7 @@ import sys
 from collections import Counter # Counter는 사용되지 않지만, 다른 진단 목적으로 유용할 수 있음
 
 
-def stratified_split_annotations(annotations, val_ratio, seed=42):
+def stratified_split_annotations(annotations, val_ratio, seed=random.randint(0, 10000)):
     """Return train_indices, val_indices using a stratified split by 'label'.
 
     For each label, select approx. val_ratio fraction of its indices.
@@ -233,7 +233,7 @@ def detect_label_from_path(p: Path, three_class_mode: bool = False):
 
 def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
                      normalize_method='0to1', val_ratio: float = 0.0, seed: int = 42,
-                     test_mode: bool = False, three_class_mode: bool = False):
+                     test_mode: bool = False, three_class_mode: bool = False, wbn_mode: bool = False):
     csv_root = Path(csv_root)
     # Instead of scanning the entire tree, only look under the expected
     # evaluation folders (true/false) and the five labels under them. For
@@ -323,6 +323,12 @@ def collect_and_make(csv_root: Path, out_pkl: Path, img_shape=(1080, 1920),
             frame_dir = csv.stem
             
         # csv_to_annotation은 5-class 레이블을 사용하여 어노테이션을 생성합니다.
+        # If WBN mode is enabled, skip samples labeled as good/best (3,4)
+        if wbn_mode and label_5c in (3, 4):
+            # Skip good/best samples when creating a WBN-only PKL
+            # (user intentionally wants only worst(0), bad(1), normal(2)).
+            continue
+
         ann = csv_to_annotation(csv, frame_dir=frame_dir, label=label_5c,
                                 img_shape=img_shape, normalize_method=normalize_method)
         if ann is None:
@@ -472,12 +478,15 @@ def cli():
     parser.add_argument('--test', action='store_true', help='Write test PKL: place all samples into xsub_val only')
     # three_class 플래그는 여전히 존재하며, 이제 실제로 레이블을 0, 1, 2로 변환합니다.
     parser.add_argument('--three_class', action='store_true', help='Use 3-class labels: 0(worst,bad), 1(normal), 2(good,best)')
+    # WBN: Keep only worst(0), bad(1), normal(2) classes and drop good/best samples
+    parser.add_argument('--WBN', action='store_true', help='Create a PKL containing only classes worst(0), bad(1), normal(2) and drop good/best samples')
     args = parser.parse_args()
 
     h, w = [int(x) for x in args.img_shape.split(',')]
     collect_and_make(Path(args.csv_root), Path(args.out), img_shape=(h, w),
                      normalize_method=args.normalize, val_ratio=args.val_ratio, seed=args.seed,
-                     test_mode=bool(args.test), three_class_mode=bool(args.__dict__.get('three_class', False)))
+                     test_mode=bool(args.test), three_class_mode=bool(args.__dict__.get('three_class', False)),
+                     wbn_mode=bool(args.__dict__.get('WBN', False)))
 
 
 if __name__ == '__main__':

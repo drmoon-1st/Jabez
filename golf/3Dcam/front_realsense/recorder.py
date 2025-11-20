@@ -232,7 +232,7 @@ class BufferedRealsenseRecorder:
         except Exception:
             return None
 
-    def start_saving(self, out_dir: Path):
+    def start_saving(self, out_dir: Path, drain: bool = True):
         """Start writing buffered frames and subsequent frames to disk under out_dir."""
         out_dir = Path(out_dir)
         color_dir = out_dir / 'color'
@@ -246,27 +246,40 @@ class BufferedRealsenseRecorder:
         except Exception:
             pass
 
+        # store save dirs on the instance so _run() can write live frames
+        self._save_color_dir = color_dir
+        self._save_depth_dir = depth_dir
+
         def _drain_and_flag():
-            # write existing buffered frames first
+            # Write existing buffered frames first (if drain=True), otherwise discard buffer and start from current
             try:
                 with self._save_lock:
-                    idx = self._idx
-                    # copy buffer snapshot
-                    with self._frame_lock:
-                        items = list(self._buffer)
-                    for color_img, depth_m in items:
-                        color_path = color_dir / f"{idx:06d}.png"
-                        depth_path = depth_dir / f"{idx:06d}.npy"
-                        try:
-                            cv2.imwrite(str(color_path), color_img)
-                        except Exception:
-                            pass
-                        try:
-                            if depth_m is not None:
-                                np.save(depth_path, depth_m)
-                        except Exception:
-                            pass
-                        idx += 1
+                    # start each save session from index 0 so each recording has its own numbering
+                    idx = 0
+                    if drain:
+                        # copy buffer snapshot
+                        with self._frame_lock:
+                            items = list(self._buffer)
+                        for color_img, depth_m in items:
+                            color_path = color_dir / f"{idx:06d}.png"
+                            depth_path = depth_dir / f"{idx:06d}.npy"
+                            try:
+                                cv2.imwrite(str(color_path), color_img)
+                            except Exception:
+                                pass
+                            try:
+                                if depth_m is not None:
+                                    np.save(depth_path, depth_m)
+                            except Exception:
+                                pass
+                            idx += 1
+                    else:
+                        # discard buffered frames: reset index and clear buffer
+                        with self._frame_lock:
+                            try:
+                                self._buffer.clear()
+                            except Exception:
+                                self._buffer = deque(maxlen=self._maxlen)
                     # set index to continue
                     self._idx = idx
                     # enable live saving
@@ -336,11 +349,25 @@ class BufferedRealsenseRecorder:
                             except Exception:
                                 pass
 
-                    # if saving enabled, write immediately
+                    # if saving enabled, write this frame to the active save dirs
                     if self._saving.is_set():
                         try:
                             with self._save_lock:
-                                color_path = Path.cwd() / 'tmp'  # placeholder, actual dirs set when start_saving drains
+                                # ensure target dirs were set by start_saving
+                                cdir = getattr(self, '_save_color_dir', None)
+                                ddir = getattr(self, '_save_depth_dir', None)
+                                if cdir is not None:
+                                    try:
+                                        color_path = cdir / f"{self._idx:06d}.png"
+                                        cv2.imwrite(str(color_path), color_img)
+                                    except Exception:
+                                        pass
+                                if ddir is not None:
+                                    try:
+                                        np.save(ddir / f"{self._idx:06d}.npy", depth_m)
+                                    except Exception:
+                                        pass
+                                self._idx += 1
                         except Exception:
                             pass
 
@@ -408,8 +435,9 @@ class ContinuousRecorderWrapper:
     def get_last_frame(self):
         return self._rec.get_last_frame()
 
-    def start_saving(self, out_dir: str):
-        self._rec.start_saving(Path(out_dir))
+    def start_saving(self, out_dir: str, drain: bool = True):
+        # default behavior: drain existing buffer and save it
+        self._rec.start_saving(Path(out_dir), drain=drain)
 
     def stop_saving(self):
         self._rec.stop_saving()
